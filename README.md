@@ -1,6 +1,10 @@
 # paperlessprinter
 
+![paperlessprinter intro image](./paperlessprinter.jpg)
+
 Standalone IPP-over-HTTP server that receives print jobs, converts pages to PNG, and POSTs them to a HTTPS endpoint.
+
+Used in the [paperlesspaper](https://paperlesspaper.de/en), the Open Source eInk picture frame.
 
 ## Quick start
 
@@ -15,6 +19,8 @@ cp .env.example .env
 
 python server.py
 ```
+
+curl -vk http://127.0.0.1:8631/ipp/print
 
 Server defaults to `http://0.0.0.0:8631/ipp/print`.
 
@@ -52,12 +58,24 @@ Configured via `.env`:
 
 To enable uploading, set `POST_ENDPOINT` (e.g. `https://api.memo.wirewire.de/print/`).
 
-### PaperlessPaper example
+### paperlesspaper example
 
-To send the rendered PNG to `uploadSingleImage/<paperId>`:
+To send the rendered PNG to `uploadSingleImage/<paperId>`, you can either:
 
-- `POST_ENDPOINT=http://localhost:5002/v1/papers/uploadSingleImage/<paperId>`
-- `PAPER_ID=<paperId>`
+- set a base endpoint and let the server append `/<paperId>` automatically:
+  - `POST_ENDPOINT=
+https://api.memo.wirewire.de/v1/papers/uploadSingleImage`
+  - `PAPER_ID=<paperId>`
+
+or
+
+- include a placeholder in `POST_ENDPOINT`:
+  - `POST_ENDPOINT=
+https://api.memo.wirewire.de/v1/papers/uploadSingleImage/<paperId>`
+  - `PAPER_ID=<paperId>`
+
+Full example:
+
 - `POST_AUTH_HEADER=x-api-key`
 - `POST_AUTH_VALUE=<token>`
 - `POST_FILE_FIELD=picture`
@@ -68,13 +86,16 @@ To send the rendered PNG to `uploadSingleImage/<paperId>`:
 The server accepts optional per-request overrides for `PAPER_ID` and `POST_AUTH_VALUE` via the `/ipp/print` URL.
 This lets you configure different printers (or different macOS printer entries) to upload to different Paper IDs or use different tokens.
 
-- Query params (recommended):
-  - `ipp://<your-host>:8631/ipp/print?paper_id=123&auth_value=TOKEN`
-- Path segments (also supported):
+- Path segments:
   - `ipp://<your-host>:8631/ipp/print/123` (sets `paper_id=123`)
   - `ipp://<your-host>:8631/ipp/print/123/TOKEN` (sets `paper_id=123`, `auth_value=TOKEN`)
+- Query params (not recommended, since MacOS strips these when using as clickable URL):
+  - `ipp://<your-host>:8631/ipp/print?paper_id=123&auth_value=TOKEN`
 
-`paper_id` is applied to `POST_ENDPOINT` when it contains one of these placeholders: `<paperId>`, `{PAPER_ID}`, `{paper_id}`.
+`paper_id` is applied to `POST_ENDPOINT` in two ways:
+
+- If `POST_ENDPOINT` contains one of these placeholders, it is replaced: `<paperId>`, `{PAPER_ID}`, `{paper_id}`.
+- Otherwise, if `paper_id` is set, it is appended as the final path segment: `POST_ENDPOINT.rstrip('/') + '/' + paper_id`.
 
 ### Quick upload test (no printing)
 
@@ -83,3 +104,46 @@ Uploads the newest PNG from `IPP_TEMP_DIR` (default `./temp`) using the same `PO
 ```bash
 python tools/upload_latest_png.py
 ```
+
+## Fly.io deployment
+
+This repo includes a `Dockerfile` and `fly.toml` suitable for running on [Fly.io](https://fly.io).
+
+1. Install flyctl and log in:
+
+```bash
+brew install flyctl
+fly auth login
+```
+
+2. Create the app (you can let Fly pick a name):
+
+```bash
+fly launch
+```
+
+3. Configure secrets/env (examples):
+
+```bash
+fly secrets set \
+  POST_ENDPOINT='https://example.com/print/' \
+  POST_AUTH_HEADER='x-api-key' \
+  POST_AUTH_VALUE='TOKEN'
+
+# Optional: shared-secret for inbound print jobs
+fly secrets set IPP_SHARED_TOKEN='SOME_SHARED_TOKEN'
+```
+
+4. Deploy:
+
+```bash
+fly deploy
+```
+
+### macOS printer URL
+
+Use an IPPS URL (TLS terminates at Fly):
+
+- `ipps://<your-app>.fly.dev/ipp/print`
+
+If you use `IPP_SHARED_TOKEN`, configure your client to send `X-IPP-Token`.

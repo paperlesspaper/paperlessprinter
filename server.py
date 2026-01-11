@@ -1,16 +1,14 @@
 import datetime as _dt
-import atexit
 import json
 import logging
 import os
-import socket
 import struct
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, Optional, Tuple
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 import fitz  # PyMuPDF
 import requests
@@ -20,182 +18,30 @@ from dotenv import load_dotenv
 logger = logging.getLogger("ipp")
 
 
-def _boolish(value: object) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _get_or_create_printer_uuid(spool_dir: str) -> str:
-    try:
-        base = Path(spool_dir or "./spool")
-        base.mkdir(parents=True, exist_ok=True)
-        p = base / ".printer_uuid"
-        if p.exists():
-            v = (p.read_text(encoding="utf-8") or "").strip()
-            if v:
-                return v
-        v = str(uuid.uuid4())
-        p.write_text(v, encoding="utf-8")
-        return v
-    except Exception:
-        return str(uuid.uuid4())
-
-
-def _detect_advertise_ipv4s(preferred: str = "") -> list[bytes]:
-    addrs: list[bytes] = []
-
-    def _add(ip: str) -> None:
-        ip = (ip or "").strip()
-        if not ip:
-            return
-        try:
-            packed = socket.inet_aton(ip)
-        except OSError:
-            return
-        if packed not in addrs:
-            addrs.append(packed)
-
-    _add(preferred)
-
-    # Best-effort: figure out the primary LAN IP without sending packets.
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect(("1.1.1.1", 80))
-            ip = s.getsockname()[0]
-            _add(ip)
-        finally:
-            s.close()
-    except Exception:
-        pass
-
-    # Fallbacks.
-    try:
-        host = socket.gethostname()
-        for info in socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM):
-            _add(info[4][0])
-    except Exception:
-        pass
-
-    return addrs
-
-
-def _start_bonjour_advertising(config: Dict[str, object]) -> None:
-    if not _boolish(config.get("IPP_BONJOUR_ADVERTISE")):
-        return
-
-    try:
-        from zeroconf import ServiceInfo, Zeroconf
-    except Exception as e:
-        logger.warning("Bonjour advertising requested, but zeroconf is not available: %s", e)
-        return
-
-    port = int(config.get("IPP_LISTEN_PORT", 8631) or 8631)
-    ipp_path = str(config.get("IPP_PATH", "/ipp/print") or "/ipp/print")
-
-    rp = ipp_path.lstrip("/")
-    if not rp:
-        rp = "ipp/print"
-
-    instance_name = (os.getenv("IPP_BONJOUR_NAME") or "ipp-to-png").strip() or "ipp-to-png"
-    service_name = f"{instance_name}._ipp._tcp.local."
-    server_host = (os.getenv("IPP_BONJOUR_HOST") or f"{instance_name}.local.").strip() or f"{instance_name}.local."
-    if not server_host.endswith("."):
-        server_host += "."
-
-    preferred_ip = (os.getenv("IPP_BONJOUR_ADDRESS") or "").strip()
-    addresses = _detect_advertise_ipv4s(preferred_ip)
-    if not addresses:
-        # As a last resort, announce loopback so local discovery works.
-        addresses = [socket.inet_aton("127.0.0.1")]
-
-    printer_uuid = (os.getenv("IPP_BONJOUR_UUID") or "").strip() or _get_or_create_printer_uuid(
-        str(config.get("IPP_SPOOL_DIR", "./spool") or "./spool")
-    )
-
-    # Minimal-ish AirPrint/IPP TXT record set.
-    # macOS is somewhat tolerant, but more keys generally improve driverless behavior.
-    txt = {
-        b"txtvers": b"1",
-        b"qtotal": b"1",
-        b"rp": rp.encode("utf-8"),
-        b"ty": instance_name.encode("utf-8"),
-        b"note": b"",
-        b"product": b"(ipp-to-png)",
-        b"pdl": b"application/pdf",
-        b"UUID": printer_uuid.encode("utf-8"),
-        b"Color": b"F",
-        b"Duplex": b"F",
-    }
-
-    info = ServiceInfo(
-        type_="_ipp._tcp.local.",
-        name=service_name,
-        addresses=addresses,
-        port=port,
-        properties=txt,
-        server=server_host,
-    )
-
-    zc = Zeroconf()
-    try:
-        zc.register_service(info)
-        logger.info(
-            "Bonjour: advertised %s on port %s (rp=%s)",
-            service_name,
-            port,
-            rp,
-        )
-    except Exception as e:
-        logger.warning("Bonjour: failed to register service: %s", e)
-        try:
-            zc.close()
-        except Exception:
-            pass
-        return
-
-    # Also register the common 'universal' subtype used by many AirPrint clients.
-    # This helps some UIs show it under AirPrint/driverless lists.
-    try:
-        universal = ServiceInfo(
-            type_="_universal._sub._ipp._tcp.local.",
-            name=f"{instance_name}._universal._sub._ipp._tcp.local.",
-            addresses=addresses,
-            port=port,
-            properties=txt,
-            server=server_host,
-        )
-        zc.register_service(universal)
-    except Exception:
-        universal = None
-
-    def _cleanup() -> None:
-        try:
-            if universal is not None:
-                zc.unregister_service(universal)
-            zc.unregister_service(info)
-        except Exception:
-            pass
-        try:
-            zc.close()
-        except Exception:
-            pass
-
-    atexit.register(_cleanup)
-
-
 def _resolve_endpoint_template(endpoint: str, paper_id: str) -> str:
     if not endpoint or not paper_id:
         return endpoint
     # Support a few common placeholder styles.
-    return (
-        endpoint.replace("<paperId>", paper_id)
-        .replace("{PAPER_ID}", paper_id)
-        .replace("{paper_id}", paper_id)
-    )
+    placeholders = ("<paperId>", "{PAPER_ID}", "{paper_id}")
+    if any(p in endpoint for p in placeholders):
+        return (
+            endpoint.replace("<paperId>", paper_id)
+            .replace("{PAPER_ID}", paper_id)
+            .replace("{paper_id}", paper_id)
+        )
+
+    # If no placeholder is present, treat POST_ENDPOINT as a base URL and
+    # append the paper_id as the final path segment.
+    parts = urlsplit(endpoint)
+    existing_path = parts.path or ""
+    normalized_existing = existing_path.rstrip("/")
+    candidate_path = normalized_existing + "/" + paper_id
+
+    # Avoid double-appending if it's already present.
+    if normalized_existing.endswith("/" + paper_id) or normalized_existing == paper_id:
+        candidate_path = existing_path
+
+    return urlunsplit((parts.scheme, parts.netloc, candidate_path, parts.query, parts.fragment))
 
 
 def _split_ipp_path_and_overrides(raw_path: str, ipp_base_path: str) -> Tuple[Optional[str], Dict[str, str], str]:
@@ -225,8 +71,10 @@ def _split_ipp_path_and_overrides(raw_path: str, ipp_base_path: str) -> Tuple[Op
     overrides: Dict[str, str] = {}
 
     # Query params (preferred)
-    paper_id_q = _first("paper_id") or _first("paperId") or _first("paper")
-    auth_value_q = _first("auth_value") or _first("token") or _first("auth")
+    # Note: accept both snake_case and a few historical/alternate spellings.
+    # Some systems refer to these as PAPER_ID / AUTH_VALUE (waitlist-style).
+    paper_id_q = _first("paper_id") or _first("paperId") or _first("paper") or _first("PAPER_ID")
+    auth_value_q = _first("auth_value") or _first("token") or _first("auth") or _first("AUTH_VALUE")
     if paper_id_q:
         overrides["paper_id"] = paper_id_q
     if auth_value_q:
@@ -361,7 +209,6 @@ VT_URI = 0x45
 VT_CHARSET = 0x47
 VT_NATURAL_LANGUAGE = 0x48
 VT_MIME_MEDIA_TYPE = 0x49
-VT_COLLECTION = 0x34
 VT_BOOLEAN = 0x22
 VT_INTEGER = 0x21
 VT_ENUM = 0x23
@@ -370,35 +217,6 @@ VT_ENUM = 0x23
 def _ipp_attr(tag: int, name: str, value: bytes) -> bytes:
     name_b = name.encode("utf-8")
     return bytes([tag]) + struct.pack(">H", len(name_b)) + name_b + struct.pack(">H", len(value)) + value
-
-
-def _ipp_collection(members: list[tuple[int, str, bytes]]) -> bytes:
-    out = bytearray()
-    for tag, name, value in members:
-        out += _ipp_attr(tag, name, value)
-    # Collections are terminated with end-of-attributes tag inside the value.
-    out += bytes([TAG_END_OF_ATTRIBUTES])
-    return bytes(out)
-
-
-def _ipp_attr_collection(name: str, members: list[tuple[int, str, bytes]]) -> bytes:
-    return _ipp_attr(VT_COLLECTION, name, _ipp_collection(members))
-
-
-def _ipp_attr_collection_set(name: str, collections: list[list[tuple[int, str, bytes]]]) -> bytes:
-    if not collections:
-        return b""
-    out = bytearray()
-    first = True
-    for members in collections:
-        value = _ipp_collection(members)
-        if first:
-            out += _ipp_attr(VT_COLLECTION, name, value)
-            first = False
-        else:
-            # additional value: name-length = 0
-            out += bytes([VT_COLLECTION]) + struct.pack(">H", 0) + struct.pack(">H", len(value)) + value
-    return bytes(out)
 
 
 def _ipp_attr_str(tag: int, name: str, value: str) -> bytes:
@@ -429,19 +247,18 @@ def _ipp_attr_i32_set(tag: int, name: str, values: list[int]) -> bytes:
 
 
 def _ipp_attr_str_set(tag: int, name: str, values: list[str]) -> bytes:
-    values = [v.strip() for v in (values or []) if (v or "").strip()]
     if not values:
         return b""
     out = bytearray()
     first = True
     for v in values:
-        vb = v.encode("utf-8")
+        value_b = (v or "").encode("utf-8")
         if first:
-            out += _ipp_attr(tag, name, vb)
+            out += _ipp_attr(tag, name, value_b)
             first = False
         else:
             # additional value: name-length = 0
-            out += bytes([tag]) + struct.pack(">H", 0) + struct.pack(">H", len(vb)) + vb
+            out += bytes([tag]) + struct.pack(">H", 0) + struct.pack(">H", len(value_b)) + value_b
     return bytes(out)
 
 
@@ -465,7 +282,7 @@ def build_ipp_response_with_version(
     return bytes(response)
 
 
-def build_get_printer_attributes_response(host_header: str, ipp_path: str, config: Dict[str, object]) -> bytes:
+def build_get_printer_attributes_response(host_header: str, ipp_path: str) -> bytes:
     # Prefer an explicit port if provided in Host.
     host = host_header or "127.0.0.1"
     printer_uri = f"ipp://{host}{ipp_path}"
@@ -477,16 +294,9 @@ def build_get_printer_attributes_response(host_header: str, ipp_path: str, confi
 
     attrs += bytes([TAG_PRINTER_ATTRIBUTES])
     attrs += _ipp_attr_str(VT_URI, "printer-uri-supported", printer_uri)
-    # Helps some clients treat the printer as stable/driverless.
-    try:
-        printer_uuid = _get_or_create_printer_uuid(str(config.get("IPP_SPOOL_DIR", "./spool") or "./spool"))
-        attrs += _ipp_attr_str(VT_URI, "printer-uuid", f"urn:uuid:{printer_uuid}")
-    except Exception:
-        pass
     attrs += _ipp_attr_str(VT_KEYWORD, "uri-authentication-supported", "none")
     attrs += _ipp_attr_str(VT_KEYWORD, "uri-security-supported", "none")
     attrs += _ipp_attr_str(VT_NAME_WITHOUT_LANGUAGE, "printer-name", "ipp-to-png")
-    attrs += _ipp_attr_str(VT_TEXT_WITHOUT_LANGUAGE, "printer-info", "ipp-to-png")
     attrs += _ipp_attr_str(VT_TEXT_WITHOUT_LANGUAGE, "printer-make-and-model", "ipp-to-png")
     attrs += _ipp_attr_str(VT_KEYWORD, "ipp-versions-supported", "1.1")
     attrs += _ipp_attr_i32_set(
@@ -512,67 +322,14 @@ def build_get_printer_attributes_response(host_header: str, ipp_path: str, confi
     attrs += _ipp_attr_str(VT_MIME_MEDIA_TYPE, "document-format-supported", "application/pdf")
     attrs += _ipp_attr_str(VT_KEYWORD, "compression-supported", "none")
 
-    # Paper sizes / media.
-    # We publish both:
-    # - `media-supported` keywords (so they show up in basic UIs)
-    # - `media-col-database` entries with exact dimensions (for driverless stacks)
-
-    def _hundredths_mm_for_pixels(px: int, dpi: int) -> int:
-        # IPP uses 1/100 mm for x-dimension/y-dimension.
-        return max(1, int(round((px / float(dpi)) * 25.4 * 100.0)))
-
-    render_dpi = int(config.get("IPP_RENDER_DPI", 150) or 150)
-    epaper_presets = [
-        ("epaper", 600, 448),
-        ("epd7", 800, 480),
-        ("openpaper13", 1600, 1200),
-    ]
-    epaper_media_keywords = [p[0] for p in epaper_presets]
-
-    media_default = (_env_str("IPP_MEDIA_DEFAULT", "iso_a4_210x297mm") or "").strip()
-    media_supported = [
-        v
-        for v in (
-            _env_str(
-                "IPP_MEDIA_SUPPORTED",
-                "iso_a4_210x297mm,na_letter_8.5x11in," + ",".join(epaper_media_keywords),
-            )
-            or ""
-        ).split(",")
-        if v.strip()
-    ]
-    if media_default and media_default not in media_supported:
-        media_supported.insert(0, media_default)
-    if media_default:
-        attrs += _ipp_attr_str(VT_KEYWORD, "media-default", media_default)
-    attrs += _ipp_attr_str_set(VT_KEYWORD, "media-supported", media_supported)
-    # Some clients look at what's currently "ready" in addition to supported.
-    if media_default:
-        attrs += _ipp_attr_str(VT_KEYWORD, "media-ready", media_default)
-        attrs += _ipp_attr_str_set(VT_KEYWORD, "media-ready-supported", [media_default])
-
-    # Publish custom named sizes with exact dimensions (derived from the pixel targets at IPP_RENDER_DPI).
-    # This gives the driverless stack a place to learn the actual size for epaper/epd7/openpaper13.
-    media_col_db: list[list[tuple[int, str, bytes]]] = []
-    for key, w_px, h_px in epaper_presets:
-        x_100mm = _hundredths_mm_for_pixels(w_px, render_dpi)
-        y_100mm = _hundredths_mm_for_pixels(h_px, render_dpi)
-        media_col_db.append(
-            [
-                (VT_KEYWORD, "media-key", key.encode("utf-8")),
-                (
-                    VT_COLLECTION,
-                    "media-size",
-                    _ipp_collection(
-                        [
-                            (VT_INTEGER, "x-dimension", struct.pack(">i", int(x_100mm))),
-                            (VT_INTEGER, "y-dimension", struct.pack(">i", int(y_100mm))),
-                        ]
-                    ),
-                ),
-            ]
-        )
-    attrs += _ipp_attr_collection_set("media-col-database", media_col_db)
+    # Tell clients (notably macOS/CUPS) that this printer supports color.
+    # Without these, macOS may default the print pipeline/preview to B/W.
+    attrs += _ipp_attr_bool("color-supported", True)
+    attrs += _ipp_attr_str_set(VT_KEYWORD, "print-color-mode-supported", ["auto", "color", "monochrome"])
+    attrs += _ipp_attr_str(VT_KEYWORD, "print-color-mode-default", "auto")
+    # Older/alternate attribute name still used by some clients.
+    attrs += _ipp_attr_str_set(VT_KEYWORD, "output-mode-supported", ["auto", "color", "monochrome"])
+    attrs += _ipp_attr_str(VT_KEYWORD, "output-mode-default", "auto")
 
     return bytes(attrs)
 
@@ -648,7 +405,7 @@ def parse_ipp_request(raw: bytes) -> Tuple[Dict[str, str], bytes]:
         # capture a few common fields if present
         # names are bytes; values may not be utf-8, so decode carefully
         name_str = name.decode("utf-8", errors="ignore")
-        if name_str in {"job-name", "document-format", "printer-uri", "requesting-user-name", "job-uri", "media"}:
+        if name_str in {"job-name", "document-format", "printer-uri", "requesting-user-name", "job-uri"}:
             meta[name_str] = value.decode("utf-8", errors="ignore")
 
         if name_str == "job-id" and len(value) == 4:
@@ -725,14 +482,44 @@ def post_pages(
             "image/png",
         )
     }
-    resp = requests.post(endpoint, data=data, files=files, headers=headers, timeout=timeout_seconds)
-    logger.info("POST response: status=%s", resp.status_code)
-    resp.raise_for_status()
+    try:
+        resp = requests.post(endpoint, data=data, files=files, headers=headers, timeout=timeout_seconds)
+        logger.info("POST response: status=%s", resp.status_code)
+        if resp.status_code >= 400:
+            try:
+                body = resp.text
+            except Exception:
+                body = "<unreadable response body>"
+            if body and len(body) > 2000:
+                body = body[:2000] + "...<truncated>"
+            if body:
+                logger.warning("POST response body: %s", body)
+        resp.raise_for_status()
+    except Exception:
+        # Never crash the server thread on upload failures.
+        logger.exception("Upload failed")
 
 
 class IppHandler(BaseHTTPRequestHandler):
     server_version = "ipp-to-png/0.1"
     protocol_version = "HTTP/1.1"
+
+    def do_GET(self) -> None:
+        # Lightweight health endpoint for container platforms (Fly.io, etc.)
+        path_only = (self.path or "/").split("?", 1)[0]
+        if path_only in {"/healthz", "/health"}:
+            body = b"ok\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except ConnectionResetError:
+                logger.debug("Client reset connection while writing health response")
+            return
+
+        self.send_error(404)
 
     def do_POST(self) -> None:
         config = self.server.config  # type: ignore[attr-defined]
@@ -750,27 +537,41 @@ class IppHandler(BaseHTTPRequestHandler):
             logger.debug("HTTP request: client=%s path=%s", self.client_address, safe_path_for_logs)
 
         if path_only is None:
-            # macOS/CUPS sometimes probes alternate IPP resources like /ipp/faxout (and
-            # occasionally /) during setup/connection checks. Treat these as aliases so
-            # the queue doesn't end up marked as disconnected.
-            request_path = (urlsplit(self.path).path or "").strip() or "/"
-            content_type = (self.headers.get("Content-Type") or "").lower()
-            if content_type.startswith("application/ipp") and request_path in {"/", "/ipp/faxout"}:
-                path_only, overrides, safe_path_for_logs = _split_ipp_path_and_overrides(self.path, request_path)
-                logger.info(
-                    "Treating IPP request to %s as alias for %s",
-                    request_path,
-                    config["IPP_PATH"],
-                )
-            else:
-                logger.warning("Unexpected path %s (expected %s)", safe_path_for_logs, config["IPP_PATH"])
-                self.send_error(404)
-                return
+            logger.warning("Unexpected path %s (expected %s)", safe_path_for_logs, config["IPP_PATH"])
+            self.send_error(404)
+            return
 
-        effective_paper_id = (overrides.get("paper_id") or config.get("PAPER_ID") or "").strip()
-        effective_auth_value = (overrides.get("auth_value") or config.get("POST_AUTH_VALUE") or "").strip()
+        # Cache per-client overrides when present. macOS may later omit them.
+        client_ip = (self.client_address[0] if self.client_address else "") or ""
+        user_agent = (self.headers.get("User-Agent") or "").strip()
+        client_key = f"{client_ip}|{user_agent}"
+        try:
+            self.server.register_client_overrides(client_key, overrides)  # type: ignore[attr-defined]
+        except Exception:
+            logger.exception("Failed to register client overrides")
+
+        # IMPORTANT: do not fall back to .env values here.
+        # The per-request values (e.g. from a waitlist-generated printer URL) are the source of truth.
+        effective_paper_id = (overrides.get("paper_id") or "").strip()
+        effective_auth_value = (overrides.get("auth_value") or "").strip()
+
+        # If not provided on this request, reuse the last overrides seen for this client.
+        if not effective_paper_id or not effective_auth_value:
+            try:
+                cached = self.server.get_client_overrides(client_key)  # type: ignore[attr-defined]
+            except Exception:
+                cached = {}
+                logger.exception("Failed to fetch client overrides")
+            if not effective_paper_id:
+                effective_paper_id = (cached.get("paper_id") or "").strip()
+            if not effective_auth_value:
+                effective_auth_value = (cached.get("auth_value") or "").strip()
         effective_endpoint = _resolve_endpoint_template(config.get("POST_ENDPOINT") or "", effective_paper_id)
         post_enabled = bool(effective_endpoint)
+
+        if post_enabled and not effective_paper_id:
+            logger.warning("Upload disabled for this request: missing paper_id (path=%s)", safe_path_for_logs)
+            post_enabled = False
 
         shared = config.get("IPP_SHARED_TOKEN")
         if shared:
@@ -843,7 +644,7 @@ class IppHandler(BaseHTTPRequestHandler):
         # macOS probes printers with Get-Printer-Attributes before it will add them.
         if operation_id == IPP_OP_GET_PRINTER_ATTRIBUTES:
             logger.debug("Handling Get-Printer-Attributes")
-            attr_bytes = build_get_printer_attributes_response(self.headers.get("Host", ""), config["IPP_PATH"], config)
+            attr_bytes = build_get_printer_attributes_response(self.headers.get("Host", ""), config["IPP_PATH"])
             response = build_ipp_response_with_version(vmaj, vmin, 0x0000, request_id, attr_bytes)
             self.send_response(200)
             self.send_header("Content-Type", "application/ipp")
@@ -886,6 +687,12 @@ class IppHandler(BaseHTTPRequestHandler):
             (spool_dir / "request.ipp").write_bytes(raw)
             (spool_dir / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
             self.server.register_job(job_id_int, spool_dir)  # type: ignore[attr-defined]
+            # Persist any per-request overrides so Send-Document can reuse them.
+            # macOS may not preserve query params/path segments on the follow-up request.
+            try:
+                self.server.register_job_overrides(job_id_int, overrides)  # type: ignore[attr-defined]
+            except Exception:
+                logger.exception("Failed to register job overrides")
 
             attrs = bytearray()
             attrs += bytes([TAG_OPERATION_ATTRIBUTES])
@@ -917,6 +724,28 @@ class IppHandler(BaseHTTPRequestHandler):
 
             job_id_str = meta.get("job-id", "")
             job_id_int = int(job_id_str) if job_id_str.isdigit() else 0
+
+            # Resolve overrides for this job.
+            # If the HTTP path doesn't carry query params anymore (common on macOS), reuse Create-Job overrides.
+            if job_id_int and (not effective_paper_id or not effective_auth_value):
+                try:
+                    job_overrides = self.server.get_job_overrides(job_id_int)  # type: ignore[attr-defined]
+                except Exception:
+                    job_overrides = {}
+                    logger.exception("Failed to fetch job overrides")
+                if not effective_paper_id:
+                    effective_paper_id = (job_overrides.get("paper_id") or "").strip()
+                if not effective_auth_value:
+                    effective_auth_value = (job_overrides.get("auth_value") or "").strip()
+
+            # Recompute endpoint/post_enabled now that we may have effective_paper_id.
+            effective_endpoint = _resolve_endpoint_template(config.get("POST_ENDPOINT") or "", effective_paper_id)
+            post_enabled = bool(effective_endpoint)
+
+            # If paper_id is missing, the PaperlessPaper uploadSingleImage endpoint will be invalid.
+            if post_enabled and not effective_paper_id:
+                logger.warning("Upload disabled for this job: missing paper_id (path=%s)", safe_path_for_logs)
+                post_enabled = False
             spool_dir = self.server.get_job_spool_dir(job_id_int) if job_id_int else None  # type: ignore[attr-defined]
             if spool_dir is None:
                 job_uuid = uuid.uuid4().hex
@@ -1074,6 +903,8 @@ class IppServer(ThreadingHTTPServer):
         self._job_lock = threading.Lock()
         self._next_job_id = 1
         self._jobs: Dict[int, Path] = {}
+        self._job_overrides: Dict[int, Dict[str, str]] = {}
+        self._client_overrides: Dict[str, Dict[str, str]] = {}
 
     def allocate_job_id(self) -> int:
         with self._job_lock:
@@ -1085,9 +916,42 @@ class IppServer(ThreadingHTTPServer):
         with self._job_lock:
             self._jobs[job_id] = spool_dir
 
+    def register_job_overrides(self, job_id: int, overrides: Dict[str, str]) -> None:
+        # Store only the specific override keys we care about.
+        paper_id = (overrides.get("paper_id") or "").strip()
+        auth_value = (overrides.get("auth_value") or "").strip()
+        with self._job_lock:
+            self._job_overrides[job_id] = {"paper_id": paper_id, "auth_value": auth_value}
+
+    def get_job_overrides(self, job_id: int) -> Dict[str, str]:
+        with self._job_lock:
+            return dict(self._job_overrides.get(job_id) or {})
+
     def get_job_spool_dir(self, job_id: int) -> Optional[Path]:
         with self._job_lock:
             return self._jobs.get(job_id)
+
+    def register_client_overrides(self, key: str, overrides: Dict[str, str]) -> None:
+        if not key:
+            return
+        paper_id = (overrides.get("paper_id") or "").strip()
+        auth_value = (overrides.get("auth_value") or "").strip()
+        if not paper_id and not auth_value:
+            return
+        with self._job_lock:
+            existing = self._client_overrides.get(key) or {}
+            merged = dict(existing)
+            if paper_id:
+                merged["paper_id"] = paper_id
+            if auth_value:
+                merged["auth_value"] = auth_value
+            self._client_overrides[key] = merged
+
+    def get_client_overrides(self, key: str) -> Dict[str, str]:
+        if not key:
+            return {}
+        with self._job_lock:
+            return dict(self._client_overrides.get(key) or {})
 
 
 def main() -> None:
@@ -1099,9 +963,14 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    ipp_listen_port_raw = (os.getenv("IPP_LISTEN_PORT") or "").strip()
+    if not ipp_listen_port_raw:
+        # On Fly.io, a reverse proxy forwards traffic to $PORT by convention.
+        ipp_listen_port_raw = (os.getenv("PORT") or "").strip()
+
     config = {
         "IPP_LISTEN_HOST": _env_str("IPP_LISTEN_HOST", "0.0.0.0"),
-        "IPP_LISTEN_PORT": _env_int("IPP_LISTEN_PORT", 8631),
+        "IPP_LISTEN_PORT": int(ipp_listen_port_raw) if ipp_listen_port_raw else 8631,
         "IPP_PATH": _env_str("IPP_PATH", "/ipp/print"),
         "IPP_MAX_BYTES": _env_int("IPP_MAX_BYTES", 100 * 1024 * 1024),
         "IPP_SPOOL_DIR": _env_str("IPP_SPOOL_DIR", "./spool"),
@@ -1115,7 +984,6 @@ def main() -> None:
         "POST_TIMEOUT_SECONDS": _env_int("POST_TIMEOUT_SECONDS", 30),
         "POST_FILE_FIELD": _env_str("POST_FILE_FIELD", "file"),
         "POST_INCLUDE_META_FIELDS": _env_bool("POST_INCLUDE_META_FIELDS", True),
-        "IPP_BONJOUR_ADVERTISE": _env_bool("IPP_BONJOUR_ADVERTISE", False),
     }
 
     config["LOG_HEADERS"] = _env_bool("LOG_HEADERS", False)
@@ -1127,21 +995,10 @@ def main() -> None:
     server = IppServer((config["IPP_LISTEN_HOST"], config["IPP_LISTEN_PORT"]), IppHandler)
     server.config = config  # type: ignore[attr-defined]
 
-    # Optional: advertise the printer via Bonjour so macOS/iOS can discover it as AirPrint/IPP.
-    _start_bonjour_advertising(config)
-
     print(
         f"Listening on http://{config['IPP_LISTEN_HOST']}:{config['IPP_LISTEN_PORT']}{config['IPP_PATH']}"
     )
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        try:
-            server.server_close()
-        except Exception:
-            pass
+    server.serve_forever()
 
 
 if __name__ == "__main__":

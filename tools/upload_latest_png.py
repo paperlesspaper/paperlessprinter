@@ -3,6 +3,7 @@ import glob
 import os
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from dotenv import load_dotenv
@@ -25,11 +26,23 @@ def _env_bool(name: str, default: bool) -> bool:
 def _resolve_endpoint_template(endpoint: str, paper_id: str) -> str:
     if not endpoint or not paper_id:
         return endpoint
-    return (
-        endpoint.replace("<paperId>", paper_id)
-        .replace("{PAPER_ID}", paper_id)
-        .replace("{paper_id}", paper_id)
-    )
+    placeholders = ("<paperId>", "{PAPER_ID}", "{paper_id}")
+    if any(p in endpoint for p in placeholders):
+        return (
+            endpoint.replace("<paperId>", paper_id)
+            .replace("{PAPER_ID}", paper_id)
+            .replace("{paper_id}", paper_id)
+        )
+
+    parts = urlsplit(endpoint)
+    existing_path = parts.path or ""
+    normalized_existing = existing_path.rstrip("/")
+    candidate_path = normalized_existing + "/" + paper_id
+
+    if normalized_existing.endswith("/" + paper_id) or normalized_existing == paper_id:
+        candidate_path = existing_path
+
+    return urlunsplit((parts.scheme, parts.netloc, candidate_path, parts.query, parts.fragment))
 
 
 def _newest_png(temp_dir: str) -> Optional[Path]:

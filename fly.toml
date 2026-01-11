@@ -1,0 +1,48 @@
+# fly.toml app configuration file generated for paperlessprinter on 2026-01-08T01:35:06+01:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'paperlessprinter'
+primary_region = 'fra'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  IPP_LISTEN_PORT = '8080'
+  IPP_PATH = '/ipp/print'
+  POST_AUTH_HEADER = 'x-api-key'
+  POST_TIMEOUT_SECONDS= '30'
+  POST_FILE_FIELD= 'picture'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    interval = '15s'
+    timeout = '2s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/healthz'
+
+[[services]]
+  # Raw TCP listener for IPP (ipp://). Clients expect TCP/631.
+  internal_port = 8080
+  protocol = "tcp"
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 631
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024

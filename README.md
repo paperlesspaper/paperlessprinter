@@ -31,7 +31,7 @@ Server defaults to `http://0.0.0.0:8631/ipp/print`.
 - Set `IPP_SHARED_TOKEN` if you want a simple shared-secret header gate.
 - The first rendered PNG is also written to `IPP_TEMP_DIR` (default `./temp`).
 
-## macOS setup (printer)
+## Setup (printer)
 
 You can add a printer that targets the server:
 
@@ -84,7 +84,7 @@ Full example:
 #### Per-printer overrides via the IPP URL
 
 The server accepts optional per-request overrides for `PAPER_ID` and `POST_AUTH_VALUE` via the `/ipp/print` URL.
-This lets you configure different printers (or different macOS printer entries) to upload to different Paper IDs or use different tokens.
+This lets you configure different printers (or different printer entries) to upload to different Paper IDs or use different tokens.
 
 - Path segments:
   - `ipp://<your-host>:8631/ipp/print/123` (sets `paper_id=123`)
@@ -140,7 +140,7 @@ fly secrets set IPP_SHARED_TOKEN='SOME_SHARED_TOKEN'
 fly deploy
 ```
 
-### macOS printer URL
+### Printer URL
 
 Use an IPPS URL (TLS terminates at Fly):
 

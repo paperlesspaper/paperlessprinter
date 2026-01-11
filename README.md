@@ -147,3 +147,7 @@ Use an IPPS URL (TLS terminates at Fly):
 - `ipps://<your-app>.fly.dev/ipp/print`
 
 If you use `IPP_SHARED_TOKEN`, configure your client to send `X-IPP-Token`.
+
+## License
+
+AGPL-3.0. See [LICENSE](./LICENSE).

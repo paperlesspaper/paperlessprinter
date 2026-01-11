@@ -1,12 +1,14 @@
 # paperlessprinter
 
-![paperlessprinter intro image](./paperlessprinter.jpg)
+![paperlessprinter intro image](./docs/paperlessprinter.jpg)
 
-![Print dialog in Microsoft Word](./paperlessprinter-dialog.png)
+Standalone _IPP-over-HTTP_ server that receives print jobs, converts pages to PNG, and POSTs them to a HTTPS endpoint.
 
-Standalone IPP-over-HTTP server that receives print jobs, converts pages to PNG, and POSTs them to a HTTPS endpoint.
+This lets you use your ePaper device like a regular printer and allows printing from anywhere.
 
-Used in the [paperlesspaper](https://paperlesspaper.de/en), the Open Source eInk picture frame.
+Used in [paperlesspaper](https://paperlesspaper.de/en), the Open Source eInk picture frame.
+
+![Print dialog in Microsoft Word](./docs/paperlessprinter-word.jpg)
 
 ## Quick start
 
@@ -83,6 +85,8 @@ Full example:
 - `POST_FILE_FIELD=picture`
 - `POST_INCLUDE_META_FIELDS=false`
 
+![Integration in paperlesspaper App](./docs/paperlessprinter-app.png)
+
 #### Per-printer overrides via the IPP URL
 
 The server accepts optional per-request overrides for `PAPER_ID` and `POST_AUTH_VALUE` via the `/ipp/print` URL.
@@ -106,6 +110,8 @@ Uploads the newest PNG from `IPP_TEMP_DIR` (default `./temp`) using the same `PO
 ```bash
 python tools/upload_latest_png.py
 ```
+
+![Print dialog in Microsoft Word](./docs/paperlessprinter-dialog.png)
 
 ## Fly.io deployment
 
@@ -141,6 +147,8 @@ fly secrets set IPP_SHARED_TOKEN='SOME_SHARED_TOKEN'
 ```bash
 fly deploy
 ```
+
+![Print dialog in Microsoft Word](./docs/paperlessprinter-dialog-detail.jpg)
 
 ### Printer URL
 

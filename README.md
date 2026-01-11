@@ -2,6 +2,8 @@
 
 ![paperlessprinter intro image](./paperlessprinter.jpg)
 
+![Print dialog in Microsoft Word](./paperlessprinter-dialog.png)
+
 Standalone IPP-over-HTTP server that receives print jobs, converts pages to PNG, and POSTs them to a HTTPS endpoint.
 
 Used in the [paperlesspaper](https://paperlesspaper.de/en), the Open Source eInk picture frame.

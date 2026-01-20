@@ -4,6 +4,7 @@ import logging
 import os
 import struct
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -998,8 +999,40 @@ def main() -> None:
     print(
         f"Listening on http://{config['IPP_LISTEN_HOST']}:{config['IPP_LISTEN_PORT']}{config['IPP_PATH']}"
     )
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+
+
+def run_with_restart() -> None:
+    auto_restart = _env_bool("AUTO_RESTART", False)
+    if not auto_restart:
+        main()
+        return
+
+    delay_seconds = _env_int("AUTO_RESTART_DELAY_SECONDS", 2)
+    max_restarts = _env_int("AUTO_RESTART_MAX", 0)
+    attempt = 0
+
+    while True:
+        try:
+            main()
+            return
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            attempt += 1
+            logger.exception(
+                "Server crashed; restarting in %s seconds (attempt %s)",
+                delay_seconds,
+                attempt,
+            )
+            if max_restarts > 0 and attempt >= max_restarts:
+                logger.error("Reached AUTO_RESTART_MAX=%s; exiting.", max_restarts)
+                raise
+            time.sleep(max(0, delay_seconds))
 
 
 if __name__ == "__main__":
-    main()
+    run_with_restart()

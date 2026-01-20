@@ -34,6 +34,10 @@ Server defaults to `http://0.0.0.0:8631/ipp/print`.
 - For internet exposure, run behind a reverse proxy (Caddy/Nginx) for TLS.
 - Set `IPP_SHARED_TOKEN` if you want a simple shared-secret header gate.
 - The first rendered PNG is also written to `IPP_TEMP_DIR` (default `./temp`).
+- Optional auto-restart on crash:
+  - `AUTO_RESTART=true`
+  - `AUTO_RESTART_DELAY_SECONDS=2`
+  - `AUTO_RESTART_MAX=0` (0 = unlimited)
 
 ## Setup (printer)
 

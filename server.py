@@ -142,6 +142,8 @@ def _op_name(operation_id: int) -> str:
         IPP_OP_VALIDATE_JOB: "Validate-Job",
         IPP_OP_CREATE_JOB: "Create-Job",
         IPP_OP_SEND_DOCUMENT: "Send-Document",
+        IPP_OP_GET_JOB_ATTRIBUTES: "Get-Job-Attributes",
+        IPP_OP_GET_JOBS: "Get-Jobs",
         IPP_OP_GET_PRINTER_ATTRIBUTES: "Get-Printer-Attributes",
     }.get(operation_id, f"op-0x{operation_id:04x}")
 
@@ -195,7 +197,13 @@ IPP_OP_PRINT_JOB = 0x0002
 IPP_OP_VALIDATE_JOB = 0x0004
 IPP_OP_CREATE_JOB = 0x0005
 IPP_OP_SEND_DOCUMENT = 0x0006
+IPP_OP_GET_JOB_ATTRIBUTES = 0x0009
+IPP_OP_GET_JOBS = 0x000A
 IPP_OP_GET_PRINTER_ATTRIBUTES = 0x000B
+
+
+IPP_STATUS_SUCCESSFUL_OK = 0x0000
+IPP_STATUS_SERVER_ERROR_OPERATION_NOT_SUPPORTED = 0x0501
 
 
 TAG_OPERATION_ATTRIBUTES = 0x01
@@ -308,6 +316,8 @@ def build_get_printer_attributes_response(host_header: str, ipp_path: str) -> by
             IPP_OP_VALIDATE_JOB,
             IPP_OP_CREATE_JOB,
             IPP_OP_SEND_DOCUMENT,
+            IPP_OP_GET_JOB_ATTRIBUTES,
+            IPP_OP_GET_JOBS,
             IPP_OP_GET_PRINTER_ATTRIBUTES,
         ],
     )
@@ -332,6 +342,38 @@ def build_get_printer_attributes_response(host_header: str, ipp_path: str) -> by
     attrs += _ipp_attr_str_set(VT_KEYWORD, "output-mode-supported", ["auto", "color", "monochrome"])
     attrs += _ipp_attr_str(VT_KEYWORD, "output-mode-default", "auto")
 
+    return bytes(attrs)
+
+
+def build_operation_attributes() -> bytes:
+    attrs = bytearray()
+    attrs += bytes([TAG_OPERATION_ATTRIBUTES])
+    attrs += _ipp_attr_str(VT_CHARSET, "attributes-charset", "utf-8")
+    attrs += _ipp_attr_str(VT_NATURAL_LANGUAGE, "attributes-natural-language", "en")
+    return bytes(attrs)
+
+
+def build_get_job_attributes_response(host_header: str, ipp_path: str, job_id: int, job_state: int) -> bytes:
+    host = host_header or "127.0.0.1"
+    attrs = bytearray(build_operation_attributes())
+    if job_id > 0:
+        attrs += bytes([0x02])  # job-attributes-tag
+        attrs += _ipp_attr_i32(VT_INTEGER, "job-id", job_id)
+        attrs += _ipp_attr_str(VT_URI, "job-uri", f"ipp://{host}{ipp_path}/job/{job_id}")
+        attrs += _ipp_attr_i32(VT_ENUM, "job-state", job_state)
+        attrs += _ipp_attr_str(VT_KEYWORD, "job-state-reasons", "none")
+    return bytes(attrs)
+
+
+def build_get_jobs_response(host_header: str, ipp_path: str, jobs: list[Tuple[int, int]]) -> bytes:
+    host = host_header or "127.0.0.1"
+    attrs = bytearray(build_operation_attributes())
+    for job_id, job_state in jobs:
+        attrs += bytes([0x02])  # job-attributes-tag
+        attrs += _ipp_attr_i32(VT_INTEGER, "job-id", job_id)
+        attrs += _ipp_attr_str(VT_URI, "job-uri", f"ipp://{host}{ipp_path}/job/{job_id}")
+        attrs += _ipp_attr_i32(VT_ENUM, "job-state", job_state)
+        attrs += _ipp_attr_str(VT_KEYWORD, "job-state-reasons", "none")
     return bytes(attrs)
 
 
@@ -458,7 +500,8 @@ def post_pages(
 
     # Single request, only the first page PNG.
     if not png_pages:
-        raise ValueError("No PNG pages to POST")
+        logger.warning("Skipping upload: no PNG pages to POST for job_id=%s", job_id)
+        return
 
     page_num = 1 if 1 in png_pages else sorted(png_pages.keys())[0]
     png_bytes = png_pages[page_num]
@@ -646,7 +689,7 @@ class IppHandler(BaseHTTPRequestHandler):
         if operation_id == IPP_OP_GET_PRINTER_ATTRIBUTES:
             logger.debug("Handling Get-Printer-Attributes")
             attr_bytes = build_get_printer_attributes_response(self.headers.get("Host", ""), config["IPP_PATH"])
-            response = build_ipp_response_with_version(vmaj, vmin, 0x0000, request_id, attr_bytes)
+            response = build_ipp_response_with_version(vmaj, vmin, IPP_STATUS_SUCCESSFUL_OK, request_id, attr_bytes)
             self.send_response(200)
             self.send_header("Content-Type", "application/ipp")
             self.send_header("Content-Length", str(len(response)))
@@ -659,11 +702,53 @@ class IppHandler(BaseHTTPRequestHandler):
 
         if operation_id == IPP_OP_VALIDATE_JOB:
             logger.debug("Handling Validate-Job")
-            attrs = bytearray()
-            attrs += bytes([TAG_OPERATION_ATTRIBUTES])
-            attrs += _ipp_attr_str(VT_CHARSET, "attributes-charset", "utf-8")
-            attrs += _ipp_attr_str(VT_NATURAL_LANGUAGE, "attributes-natural-language", "en")
-            response = build_ipp_response_with_version(vmaj, vmin, 0x0000, request_id, bytes(attrs))
+            response = build_ipp_response_with_version(
+                vmaj,
+                vmin,
+                IPP_STATUS_SUCCESSFUL_OK,
+                request_id,
+                build_operation_attributes(),
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/ipp")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            try:
+                self.wfile.write(response)
+            except ConnectionResetError:
+                logger.debug("Client reset connection while writing response")
+            return
+
+        if operation_id == IPP_OP_GET_JOB_ATTRIBUTES:
+            logger.debug("Handling Get-Job-Attributes")
+            job_id_str = meta.get("job-id", "")
+            job_id_int = int(job_id_str) if job_id_str.isdigit() else 0
+            job_state = self.server.get_job_state(job_id_int, default=9)  # type: ignore[attr-defined]
+            attr_bytes = build_get_job_attributes_response(
+                self.headers.get("Host", ""),
+                config["IPP_PATH"],
+                job_id_int,
+                job_state,
+            )
+            response = build_ipp_response_with_version(vmaj, vmin, IPP_STATUS_SUCCESSFUL_OK, request_id, attr_bytes)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/ipp")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            try:
+                self.wfile.write(response)
+            except ConnectionResetError:
+                logger.debug("Client reset connection while writing response")
+            return
+
+        if operation_id == IPP_OP_GET_JOBS:
+            logger.debug("Handling Get-Jobs")
+            attr_bytes = build_get_jobs_response(
+                self.headers.get("Host", ""),
+                config["IPP_PATH"],
+                self.server.list_jobs(),  # type: ignore[attr-defined]
+            )
+            response = build_ipp_response_with_version(vmaj, vmin, IPP_STATUS_SUCCESSFUL_OK, request_id, attr_bytes)
             self.send_response(200)
             self.send_header("Content-Type", "application/ipp")
             self.send_header("Content-Length", str(len(response)))
@@ -709,7 +794,7 @@ class IppHandler(BaseHTTPRequestHandler):
             attrs += _ipp_attr_i32(VT_ENUM, "job-state", 3)  # pending
             attrs += _ipp_attr_str(VT_KEYWORD, "job-state-reasons", "none")
 
-            response = build_ipp_response_with_version(vmaj, vmin, 0x0000, request_id, bytes(attrs))
+            response = build_ipp_response_with_version(vmaj, vmin, IPP_STATUS_SUCCESSFUL_OK, request_id, bytes(attrs))
             self.send_response(200)
             self.send_header("Content-Type", "application/ipp")
             self.send_header("Content-Length", str(len(response)))
@@ -725,6 +810,8 @@ class IppHandler(BaseHTTPRequestHandler):
 
             job_id_str = meta.get("job-id", "")
             job_id_int = int(job_id_str) if job_id_str.isdigit() else 0
+            if job_id_int:
+                self.server.set_job_state(job_id_int, 5)  # type: ignore[attr-defined]
 
             # Resolve overrides for this job.
             # If the HTTP path doesn't carry query params anymore (common on macOS), reuse Create-Job overrides.
@@ -760,6 +847,8 @@ class IppHandler(BaseHTTPRequestHandler):
             (spool_dir / "document.bin").write_bytes(document)
 
             if not document.startswith(b"%PDF"):
+                if job_id_int:
+                    self.server.set_job_state(job_id_int, 8)  # type: ignore[attr-defined]
                 logger.warning("Unsupported document payload (first bytes=%s)", document[:12])
                 self.send_error(415, "Only PDF payloads are supported right now")
                 return
@@ -802,16 +891,42 @@ class IppHandler(BaseHTTPRequestHandler):
                 else:
                     logger.info("Upload disabled (POST_ENDPOINT empty); skipping POST")
 
+                if job_id_int:
+                    self.server.set_job_state(job_id_int, 9)  # type: ignore[attr-defined]
+
             except Exception as e:
+                if job_id_int:
+                    self.server.set_job_state(job_id_int, 8)  # type: ignore[attr-defined]
                 logger.exception("Render failed")
                 self.send_error(500, f"Render failed: {e}")
                 return
 
-            attrs = bytearray()
-            attrs += bytes([TAG_OPERATION_ATTRIBUTES])
-            attrs += _ipp_attr_str(VT_CHARSET, "attributes-charset", "utf-8")
-            attrs += _ipp_attr_str(VT_NATURAL_LANGUAGE, "attributes-natural-language", "en")
-            response = build_ipp_response_with_version(vmaj, vmin, 0x0000, request_id, bytes(attrs))
+            response = build_ipp_response_with_version(
+                vmaj,
+                vmin,
+                IPP_STATUS_SUCCESSFUL_OK,
+                request_id,
+                build_operation_attributes(),
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/ipp")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            try:
+                self.wfile.write(response)
+            except ConnectionResetError:
+                logger.debug("Client reset connection while writing response")
+            return
+
+        if operation_id != IPP_OP_PRINT_JOB:
+            logger.warning("Unsupported IPP operation %s; returning operation-not-supported", _op_name(operation_id))
+            response = build_ipp_response_with_version(
+                vmaj,
+                vmin,
+                IPP_STATUS_SERVER_ERROR_OPERATION_NOT_SUPPORTED,
+                request_id,
+                build_operation_attributes(),
+            )
             self.send_response(200)
             self.send_header("Content-Type", "application/ipp")
             self.send_header("Content-Length", str(len(response)))
@@ -881,7 +996,7 @@ class IppHandler(BaseHTTPRequestHandler):
 
         # Minimal IPP success response
         # version 1.1, status successful-ok (0x0000), same request-id
-        response = build_ipp_response_with_version(vmaj, vmin, 0x0000, request_id, b"")
+        response = build_ipp_response_with_version(vmaj, vmin, IPP_STATUS_SUCCESSFUL_OK, request_id, b"")
 
         self.send_response(200)
         self.send_header("Content-Type", "application/ipp")
@@ -904,6 +1019,7 @@ class IppServer(ThreadingHTTPServer):
         self._job_lock = threading.Lock()
         self._next_job_id = 1
         self._jobs: Dict[int, Path] = {}
+        self._job_states: Dict[int, int] = {}
         self._job_overrides: Dict[int, Dict[str, str]] = {}
         self._client_overrides: Dict[str, Dict[str, str]] = {}
 
@@ -916,6 +1032,23 @@ class IppServer(ThreadingHTTPServer):
     def register_job(self, job_id: int, spool_dir: Path) -> None:
         with self._job_lock:
             self._jobs[job_id] = spool_dir
+            self._job_states[job_id] = 3
+
+    def set_job_state(self, job_id: int, job_state: int) -> None:
+        if job_id <= 0:
+            return
+        with self._job_lock:
+            self._job_states[job_id] = job_state
+
+    def get_job_state(self, job_id: int, default: int = 9) -> int:
+        if job_id <= 0:
+            return default
+        with self._job_lock:
+            return int(self._job_states.get(job_id, default))
+
+    def list_jobs(self) -> list[Tuple[int, int]]:
+        with self._job_lock:
+            return [(job_id, int(self._job_states.get(job_id, 9))) for job_id in sorted(self._jobs)]
 
     def register_job_overrides(self, job_id: int, overrides: Dict[str, str]) -> None:
         # Store only the specific override keys we care about.

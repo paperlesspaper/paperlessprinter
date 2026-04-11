@@ -549,6 +549,7 @@ def render_document_to_pngs(document: bytes, meta: Dict[str, str], dpi: int) -> 
     if document_kind == "pdf":
         if not meta.get("document-format"):
             meta["document-format"] = "application/pdf"
+        logger.info("Rendering PDF payload to PNG via PyMuPDF")
         return render_pdf_to_pngs(document, dpi=dpi)
 
     if document_kind == "postscript":
@@ -580,7 +581,6 @@ def post_pages(
     total_pages: int,
     png_pages: Dict[int, bytes],
 ) -> None:
-    logger.info("Upload enabled: POSTing first PNG to %s", endpoint)
     headers = {}
     if auth_header and auth_value:
         headers[auth_header] = auth_value
@@ -592,7 +592,14 @@ def post_pages(
 
     page_num = 1 if 1 in png_pages else sorted(png_pages.keys())[0]
     png_bytes = png_pages[page_num]
-    logger.debug("POST payload: job_id=%s page=%s total_pages=%s png_bytes=%d", job_id, page_num, total_pages, len(png_bytes))
+    logger.info(
+        "POST start: endpoint=%s job_id=%s page=%s total_pages=%s png_bytes=%d",
+        endpoint,
+        job_id,
+        page_num,
+        total_pages,
+        len(png_bytes),
+    )
 
     data = {}
     if include_meta_fields:
@@ -615,7 +622,13 @@ def post_pages(
     }
     try:
         resp = requests.post(endpoint, data=data, files=files, headers=headers, timeout=timeout_seconds)
-        logger.info("POST response: status=%s", resp.status_code)
+        logger.info(
+            "POST response: endpoint=%s status=%s job_id=%s page=%s",
+            endpoint,
+            resp.status_code,
+            job_id,
+            page_num,
+        )
         if resp.status_code >= 400:
             try:
                 body = resp.text
@@ -626,9 +639,10 @@ def post_pages(
             if body:
                 logger.warning("POST response body: %s", body)
         resp.raise_for_status()
+        logger.info("POST succeeded: endpoint=%s job_id=%s page=%s", endpoint, job_id, page_num)
     except Exception:
         # Never crash the server thread on upload failures.
-        logger.exception("Upload failed")
+        logger.exception("Upload failed: endpoint=%s job_id=%s page=%s", endpoint, job_id, page_num)
 
 
 class IppHandler(BaseHTTPRequestHandler):
@@ -937,15 +951,25 @@ class IppHandler(BaseHTTPRequestHandler):
                 total, pages = render_document_to_pngs(document, meta, dpi=config["IPP_RENDER_DPI"])
                 for page_num, png_bytes in pages.items():
                     (spool_dir / f"page_{page_num:04d}.png").write_bytes(png_bytes)
+                logger.info(
+                    "PNG generation succeeded: job_id=%s total_pages=%s spool_dir=%s",
+                    job_id_int or "(unknown)",
+                    total,
+                    spool_dir,
+                )
 
                 if pages:
                     first_page_num = 1 if 1 in pages else sorted(pages.keys())[0]
                     temp_dir = config.get("IPP_TEMP_DIR", "./temp")
                     temp_job_id = str(job_id_int) if job_id_int else "send"
                     store_first_png_in_temp(temp_dir, temp_job_id, first_page_num, pages[first_page_num])
+                    first_png_path = (Path(temp_dir) / f"{temp_job_id}_p{first_page_num}.png").resolve()
                     logger.info(
-                        "Wrote first PNG to %s",
-                        (Path(temp_dir) / f"{temp_job_id}_p{first_page_num}.png").resolve(),
+                        "PNG stored: job_id=%s first_page=%s png_bytes=%s path=%s",
+                        temp_job_id,
+                        first_page_num,
+                        len(pages[first_page_num]),
+                        first_png_path,
                     )
 
                 # POST in background so the IPP response is quick
@@ -1039,13 +1063,26 @@ class IppHandler(BaseHTTPRequestHandler):
             total, pages = render_document_to_pngs(document, meta, dpi=config["IPP_RENDER_DPI"])
             for page_num, png_bytes in pages.items():
                 (spool_dir / f"page_{page_num:04d}.png").write_bytes(png_bytes)
+            logger.info(
+                "PNG generation succeeded: job_id=%s total_pages=%s spool_dir=%s",
+                job_id,
+                total,
+                spool_dir,
+            )
 
             # Also store the first page PNG into /temp (or configured temp dir)
             if pages:
                 first_page_num = 1 if 1 in pages else sorted(pages.keys())[0]
                 temp_dir = config.get("IPP_TEMP_DIR", "./temp")
                 store_first_png_in_temp(temp_dir, job_id, first_page_num, pages[first_page_num])
-                logger.info("Wrote first PNG to %s", (Path(temp_dir) / f"{job_id}_p{first_page_num}.png").resolve())
+                first_png_path = (Path(temp_dir) / f"{job_id}_p{first_page_num}.png").resolve()
+                logger.info(
+                    "PNG stored: job_id=%s first_page=%s png_bytes=%s path=%s",
+                    job_id,
+                    first_page_num,
+                    len(pages[first_page_num]),
+                    first_png_path,
+                )
 
             # POST in background so the IPP response is quick
             if post_enabled:

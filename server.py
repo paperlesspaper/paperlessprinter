@@ -534,14 +534,26 @@ def parse_ipp_request(raw: bytes) -> Tuple[Dict[str, str], bytes]:
 
 def render_pdf_to_pngs(pdf_bytes: bytes, dpi: int) -> Tuple[int, Dict[int, bytes]]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    total = doc.page_count
-    pages: Dict[int, bytes] = {}
-    for index in range(total):
-        page = doc.load_page(index)
-        pix = page.get_pixmap(dpi=dpi, alpha=False)
-        pages[index + 1] = pix.tobytes("png")
-    doc.close()
-    return total, pages
+    try:
+        if bool(getattr(doc, "needs_pass", False)):
+            if not doc.authenticate(""):
+                raise ValueError("PDF payload is encrypted and requires a password")
+
+        total = doc.page_count
+        if total <= 0:
+            encrypted = bool(getattr(doc, "is_encrypted", False))
+            if encrypted:
+                raise ValueError("PDF payload could not be rendered because it is encrypted")
+            raise ValueError("PDF payload contains zero pages")
+
+        pages: Dict[int, bytes] = {}
+        for index in range(total):
+            page = doc.load_page(index)
+            pix = page.get_pixmap(dpi=dpi, alpha=False)
+            pages[index + 1] = pix.tobytes("png")
+        return total, pages
+    finally:
+        doc.close()
 
 
 def render_document_to_pngs(document: bytes, meta: Dict[str, str], dpi: int) -> Tuple[int, Dict[int, bytes]]:

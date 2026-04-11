@@ -273,11 +273,12 @@ def _read_exact(rfile, n: int) -> bytes:
 
 def _read_chunked_body(rfile, max_bytes: int) -> bytes:
     body = bytearray()
+    chunk_count = 0
     while True:
         # chunk-size line (hex) optionally followed by extensions
         line = rfile.readline(65536)
         if not line:
-            break
+            raise ValueError("Incomplete chunked body: missing terminating chunk")
         line = line.strip()
         if b";" in line:
             line = line.split(b";", 1)[0]
@@ -291,12 +292,17 @@ def _read_chunked_body(rfile, max_bytes: int) -> bytes:
                 trailer = rfile.readline(65536)
                 if not trailer or trailer in {b"\r\n", b"\n"}:
                     break
+            logger.debug("Finished chunked request body: chunks=%d total_bytes=%d", chunk_count, len(body))
             break
         if len(body) + chunk_size > max_bytes:
             raise ValueError("Chunked body exceeds limit")
+        chunk_count += 1
+        logger.debug("Reading chunk %d with %d bytes", chunk_count, chunk_size)
         body += _read_exact(rfile, chunk_size)
         # consume CRLF
-        _ = rfile.readline(3)
+        chunk_ending = rfile.readline(3)
+        if chunk_ending not in {b"\r\n", b"\n"}:
+            raise ValueError("Invalid chunk terminator")
     return bytes(body)
 
 
@@ -789,9 +795,12 @@ class IppHandler(BaseHTTPRequestHandler):
 
         # Some clients (incl. macOS printing stack) use Expect: 100-continue.
         if (self.headers.get("Expect") or "").lower() == "100-continue":
-            logger.debug("Sending 100-continue")
-            self.send_response_only(100)
-            self.end_headers()
+            if config.get("IPP_SEND_EXPECT_CONTINUE", True):
+                logger.debug("Sending 100-continue")
+                self.send_response_only(100)
+                self.end_headers()
+            else:
+                logger.debug("Suppressing 100-continue response due to IPP_SEND_EXPECT_CONTINUE=false")
 
         raw: bytes
         length = self.headers.get("Content-Length")
@@ -1349,6 +1358,7 @@ def main() -> None:
         "IPP_SPOOL_DIR": _env_str("IPP_SPOOL_DIR", "./spool"),
         "IPP_RENDER_DPI": _env_int("IPP_RENDER_DPI", 150),
         "IPP_TEMP_DIR": _env_str("IPP_TEMP_DIR", "./temp"),
+        "IPP_SEND_EXPECT_CONTINUE": _env_bool("IPP_SEND_EXPECT_CONTINUE", True),
         "IPP_SHARED_TOKEN": os.getenv("IPP_SHARED_TOKEN") or "",
         "PAPER_ID": os.getenv("PAPER_ID") or "",
         "POST_ENDPOINT": _env_str("POST_ENDPOINT", ""),

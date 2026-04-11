@@ -1,4 +1,5 @@
 import datetime as _dt
+import hashlib
 import json
 import logging
 import os
@@ -141,6 +142,50 @@ def _redacted_headers(headers) -> Dict[str, str]:
         else:
             out[k] = v
     return out
+
+
+def _document_debug_fields(document: bytes) -> Dict[str, object]:
+    tail_window = document[-1024:] if len(document) > 1024 else document
+    return {
+        "bytes": len(document),
+        "sha256": hashlib.sha256(document).hexdigest() if document else "",
+        "first16": document[:16].hex(),
+        "last16": document[-16:].hex() if document else "",
+        "has_pdf_header": document.startswith(b"%PDF"),
+        "has_ps_header": document.startswith(b"%!PS"),
+        "has_pdf_eof": b"%%EOF" in tail_window,
+        "has_startxref": b"startxref" in tail_window,
+    }
+
+
+def _log_document_diagnostics(prefix: str, document: bytes) -> None:
+    info = _document_debug_fields(document)
+    logger.debug(
+        "%s bytes=%s sha256=%s first16=%s last16=%s pdf_header=%s ps_header=%s pdf_eof=%s startxref=%s",
+        prefix,
+        info["bytes"],
+        info["sha256"],
+        info["first16"],
+        info["last16"],
+        info["has_pdf_header"],
+        info["has_ps_header"],
+        info["has_pdf_eof"],
+        info["has_startxref"],
+    )
+
+
+def _log_pdf_state(prefix: str, doc, pdf_bytes: bytes) -> None:
+    metadata = getattr(doc, "metadata", None) or {}
+    logger.debug(
+        "%s page_count=%s needs_pass=%s is_encrypted=%s producer=%s title=%s",
+        prefix,
+        getattr(doc, "page_count", None),
+        bool(getattr(doc, "needs_pass", False)),
+        bool(getattr(doc, "is_encrypted", False)),
+        (metadata.get("producer") or "")[:120],
+        (metadata.get("title") or "")[:120],
+    )
+    _log_document_diagnostics(f"{prefix} bytes", pdf_bytes)
 
 
 def _ghostscript_command() -> str:
@@ -535,13 +580,16 @@ def parse_ipp_request(raw: bytes) -> Tuple[Dict[str, str], bytes]:
 def render_pdf_to_pngs(pdf_bytes: bytes, dpi: int) -> Tuple[int, Dict[int, bytes]]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
+        _log_pdf_state("PDF diagnostics", doc, pdf_bytes)
         if bool(getattr(doc, "needs_pass", False)):
             if not doc.authenticate(""):
+                _log_pdf_state("PDF password required", doc, pdf_bytes)
                 raise ValueError("PDF payload is encrypted and requires a password")
 
         total = doc.page_count
         if total <= 0:
             encrypted = bool(getattr(doc, "is_encrypted", False))
+            _log_pdf_state("PDF zero-page diagnostics", doc, pdf_bytes)
             if encrypted:
                 raise ValueError("PDF payload could not be rendered because it is encrypted")
             raise ValueError("PDF payload contains zero pages")
@@ -789,6 +837,14 @@ class IppHandler(BaseHTTPRequestHandler):
         request_id = int(meta.get("request_id", "0") or "0")
         vmaj = int(meta.get("ipp_version_major", "1") or "1")
         vmin = int(meta.get("ipp_version_minor", "1") or "1")
+        logger.debug(
+            "Request transport: content_length_header=%s transfer_encoding=%s raw_bytes=%d",
+            length,
+            transfer_encoding,
+            len(raw),
+        )
+        if document:
+            _log_document_diagnostics("Received document diagnostics", document)
         logger.info(
             "IPP request: op=%s request_id=%s job_name=%s document_format=%s document_bytes=%d",
             _op_name(operation_id),

@@ -2,7 +2,10 @@ import datetime as _dt
 import json
 import logging
 import os
+import shutil
 import struct
+import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -17,6 +20,10 @@ from dotenv import load_dotenv
 
 
 logger = logging.getLogger("ipp")
+
+
+def _utc_timestamp_compact() -> str:
+    return _dt.datetime.now(_dt.UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
 def _resolve_endpoint_template(endpoint: str, paper_id: str) -> str:
@@ -134,6 +141,70 @@ def _redacted_headers(headers) -> Dict[str, str]:
         else:
             out[k] = v
     return out
+
+
+def _ghostscript_command() -> str:
+    return shutil.which("gs") or shutil.which("ghostscript") or ""
+
+
+def _supported_document_formats() -> list[str]:
+    formats = ["application/pdf"]
+    if _ghostscript_command():
+        formats.extend(["application/postscript", "application/vnd.cups-postscript"])
+    return formats
+
+
+def _detect_document_kind(document: bytes, meta: Dict[str, str]) -> str:
+    if document.startswith(b"%PDF"):
+        return "pdf"
+    if document.startswith(b"%!PS"):
+        return "postscript"
+
+    declared_format = (meta.get("document-format", "") or "").strip().lower()
+    if declared_format == "application/pdf":
+        return "pdf"
+    if declared_format in {"application/postscript", "application/vnd.cups-postscript"}:
+        return "postscript"
+    return "unknown"
+
+
+def render_postscript_to_pngs(document: bytes, dpi: int) -> Tuple[int, Dict[int, bytes]]:
+    gs_command = _ghostscript_command()
+    if not gs_command:
+        raise ValueError(
+            "PostScript payload received but Ghostscript is not installed; install Ghostscript to accept Generic IPP/PostScript printer output"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="ipp-postscript-") as temp_dir:
+        input_path = Path(temp_dir) / "input.ps"
+        output_pattern = Path(temp_dir) / "page-%04d.png"
+        input_path.write_bytes(document)
+
+        result = subprocess.run(
+            [
+                gs_command,
+                "-q",
+                "-dSAFER",
+                "-dBATCH",
+                "-dNOPAUSE",
+                "-sDEVICE=png16m",
+                f"-r{dpi}",
+                f"-sOutputFile={output_pattern}",
+                str(input_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        output_files = sorted(Path(temp_dir).glob("page-*.png"))
+        if result.returncode != 0 or not output_files:
+            details = (result.stderr or result.stdout or "Ghostscript conversion failed").strip()
+            raise ValueError(f"Failed to render PostScript payload: {details}")
+
+        pages: Dict[int, bytes] = {}
+        for index, output_file in enumerate(output_files, start=1):
+            pages[index] = output_file.read_bytes()
+        return len(output_files), pages
 
 
 def _op_name(operation_id: int) -> str:
@@ -330,7 +401,7 @@ def build_get_printer_attributes_response(host_header: str, ipp_path: str) -> by
     attrs += _ipp_attr_str(VT_KEYWORD, "printer-state-reasons", "none")
     attrs += _ipp_attr_i32(VT_INTEGER, "queued-job-count", 0)
     attrs += _ipp_attr_str(VT_MIME_MEDIA_TYPE, "document-format-default", "application/pdf")
-    attrs += _ipp_attr_str(VT_MIME_MEDIA_TYPE, "document-format-supported", "application/pdf")
+    attrs += _ipp_attr_str_set(VT_MIME_MEDIA_TYPE, "document-format-supported", _supported_document_formats())
     attrs += _ipp_attr_str(VT_KEYWORD, "compression-supported", "none")
 
     # Tell clients (notably macOS/CUPS) that this printer supports color.
@@ -471,6 +542,22 @@ def render_pdf_to_pngs(pdf_bytes: bytes, dpi: int) -> Tuple[int, Dict[int, bytes
         pages[index + 1] = pix.tobytes("png")
     doc.close()
     return total, pages
+
+
+def render_document_to_pngs(document: bytes, meta: Dict[str, str], dpi: int) -> Tuple[int, Dict[int, bytes]]:
+    document_kind = _detect_document_kind(document, meta)
+    if document_kind == "pdf":
+        if not meta.get("document-format"):
+            meta["document-format"] = "application/pdf"
+        return render_pdf_to_pngs(document, dpi=dpi)
+
+    if document_kind == "postscript":
+        if not meta.get("document-format"):
+            meta["document-format"] = "application/postscript"
+        logger.info("Rendering PostScript payload to PNG via Ghostscript")
+        return render_postscript_to_pngs(document, dpi=dpi)
+
+    raise ValueError(f"Unsupported document payload (first bytes={document[:12]!r})")
 
 
 def store_first_png_in_temp(temp_dir: str, job_id: str, page_num: int, png_bytes: bytes) -> None:
@@ -765,7 +852,7 @@ class IppHandler(BaseHTTPRequestHandler):
 
             job_id_int = self.server.allocate_job_id()  # type: ignore[attr-defined]
             job_uuid = uuid.uuid4().hex
-            now = _dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            now = _utc_timestamp_compact()
             spool_dir = Path(config["IPP_SPOOL_DIR"]).resolve() / f"{now}_{job_id_int}_{job_uuid}"
             spool_dir.mkdir(parents=True, exist_ok=True)
 
@@ -837,7 +924,7 @@ class IppHandler(BaseHTTPRequestHandler):
             spool_dir = self.server.get_job_spool_dir(job_id_int) if job_id_int else None  # type: ignore[attr-defined]
             if spool_dir is None:
                 job_uuid = uuid.uuid4().hex
-                now = _dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                now = _utc_timestamp_compact()
                 spool_dir = Path(config["IPP_SPOOL_DIR"]).resolve() / f"{now}_send_{job_uuid}"
                 spool_dir.mkdir(parents=True, exist_ok=True)
 
@@ -846,15 +933,8 @@ class IppHandler(BaseHTTPRequestHandler):
             (spool_dir / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
             (spool_dir / "document.bin").write_bytes(document)
 
-            if not document.startswith(b"%PDF"):
-                if job_id_int:
-                    self.server.set_job_state(job_id_int, 8)  # type: ignore[attr-defined]
-                logger.warning("Unsupported document payload (first bytes=%s)", document[:12])
-                self.send_error(415, "Only PDF payloads are supported right now")
-                return
-
             try:
-                total, pages = render_pdf_to_pngs(document, dpi=config["IPP_RENDER_DPI"])
+                total, pages = render_document_to_pngs(document, meta, dpi=config["IPP_RENDER_DPI"])
                 for page_num, png_bytes in pages.items():
                     (spool_dir / f"page_{page_num:04d}.png").write_bytes(png_bytes)
 
@@ -894,6 +974,12 @@ class IppHandler(BaseHTTPRequestHandler):
                 if job_id_int:
                     self.server.set_job_state(job_id_int, 9)  # type: ignore[attr-defined]
 
+            except ValueError as e:
+                if job_id_int:
+                    self.server.set_job_state(job_id_int, 8)  # type: ignore[attr-defined]
+                logger.warning("%s", e)
+                self.send_error(415, str(e))
+                return
             except Exception as e:
                 if job_id_int:
                     self.server.set_job_state(job_id_int, 8)  # type: ignore[attr-defined]
@@ -939,7 +1025,7 @@ class IppHandler(BaseHTTPRequestHandler):
 
         # Everything below is for Print-Job.
         job_id = uuid.uuid4().hex
-        now = _dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        now = _utc_timestamp_compact()
         spool_dir = Path(config["IPP_SPOOL_DIR"]).resolve() / f"{now}_{job_id}"
         spool_dir.mkdir(parents=True, exist_ok=True)
 
@@ -949,14 +1035,8 @@ class IppHandler(BaseHTTPRequestHandler):
         (spool_dir / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
         (spool_dir / "document.bin").write_bytes(document)
 
-        # Render (PDF-only for now)
-        if not document.startswith(b"%PDF"):
-            logger.warning("Unsupported document payload (first bytes=%s)", document[:12])
-            self.send_error(415, "Only PDF payloads are supported right now")
-            return
-
         try:
-            total, pages = render_pdf_to_pngs(document, dpi=config["IPP_RENDER_DPI"])
+            total, pages = render_document_to_pngs(document, meta, dpi=config["IPP_RENDER_DPI"])
             for page_num, png_bytes in pages.items():
                 (spool_dir / f"page_{page_num:04d}.png").write_bytes(png_bytes)
 
@@ -989,6 +1069,10 @@ class IppHandler(BaseHTTPRequestHandler):
             else:
                 logger.info("Upload disabled (POST_ENDPOINT empty); skipping POST")
 
+        except ValueError as e:
+            logger.warning("%s", e)
+            self.send_error(415, str(e))
+            return
         except Exception as e:
             logger.exception("Render/POST failed")
             self.send_error(500, f"Render/POST failed: {e}")

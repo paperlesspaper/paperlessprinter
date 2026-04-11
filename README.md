@@ -18,6 +18,9 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
+# optional but needed for Generic IPP/PostScript printer drivers
+brew install ghostscript
+
 cp .env.example .env
 # edit .env
 
@@ -31,6 +34,7 @@ Server defaults to `http://0.0.0.0:8631/ipp/print`.
 ## Notes
 
 - This is a **minimal** IPP implementation focused on `Print-Job` payload extraction.
+- PDF jobs work out of the box. PostScript jobs from Generic IPP/PostScript drivers require Ghostscript on the server host for direct raster rendering.
 - For internet exposure, run behind a reverse proxy (Caddy/Nginx) for TLS.
 - Set `IPP_SHARED_TOKEN` if you want a simple shared-secret header gate.
 - The first rendered PNG is also written to `IPP_TEMP_DIR` (default `./temp`).
@@ -48,6 +52,8 @@ You can add a printer that targets the server:
   - `ipp://<your-host>:8631/ipp/print`
 
 Driver: pick a generic PostScript/PDF-capable driver if prompted.
+
+If you use a Generic PostScript / plain IPP driver on macOS, install Ghostscript on the server host so PostScript jobs can be rendered directly to PNG. AirPrint/PDF-capable queues do not need that extra dependency.
 
 ## Outbound POST format
 

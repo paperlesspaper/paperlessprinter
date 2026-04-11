@@ -319,6 +319,7 @@ IPP_OP_GET_PRINTER_ATTRIBUTES = 0x000B
 
 
 IPP_STATUS_SUCCESSFUL_OK = 0x0000
+IPP_STATUS_CLIENT_ERROR_BAD_REQUEST = 0x0400
 IPP_STATUS_SERVER_ERROR_OPERATION_NOT_SUPPORTED = 0x0501
 
 
@@ -1015,6 +1016,31 @@ class IppHandler(BaseHTTPRequestHandler):
             (spool_dir / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
             (spool_dir / "document.bin").write_bytes(document)
 
+            if not document:
+                logger.warning(
+                    "Rejecting Send-Document with empty payload: request_id=%s job_id=%s content_length_header=%s transfer_encoding=%s",
+                    request_id,
+                    job_id_int or "(unknown)",
+                    length,
+                    transfer_encoding,
+                )
+                response = build_ipp_response_with_version(
+                    vmaj,
+                    vmin,
+                    IPP_STATUS_CLIENT_ERROR_BAD_REQUEST,
+                    request_id,
+                    build_operation_attributes(),
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "application/ipp")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                try:
+                    self.wfile.write(response)
+                except ConnectionResetError:
+                    logger.debug("Client reset connection while writing response")
+                return
+
             try:
                 total, pages = render_document_to_pngs(document, meta, dpi=config["IPP_RENDER_DPI"])
                 for page_num, png_bytes in pages.items():
@@ -1126,6 +1152,30 @@ class IppHandler(BaseHTTPRequestHandler):
         (spool_dir / "request.ipp").write_bytes(raw)
         (spool_dir / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
         (spool_dir / "document.bin").write_bytes(document)
+
+        if not document:
+            logger.warning(
+                "Rejecting Print-Job with empty payload: request_id=%s content_length_header=%s transfer_encoding=%s",
+                request_id,
+                length,
+                transfer_encoding,
+            )
+            response = build_ipp_response_with_version(
+                vmaj,
+                vmin,
+                IPP_STATUS_CLIENT_ERROR_BAD_REQUEST,
+                request_id,
+                build_operation_attributes(),
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/ipp")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            try:
+                self.wfile.write(response)
+            except ConnectionResetError:
+                logger.debug("Client reset connection while writing response")
+            return
 
         try:
             total, pages = render_document_to_pngs(document, meta, dpi=config["IPP_RENDER_DPI"])

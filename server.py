@@ -297,7 +297,6 @@ def _read_chunked_body(rfile, max_bytes: int) -> bytes:
         if len(body) + chunk_size > max_bytes:
             raise ValueError("Chunked body exceeds limit")
         chunk_count += 1
-        logger.debug("Reading chunk %d with %d bytes", chunk_count, chunk_size)
         body += _read_exact(rfile, chunk_size)
         # consume CRLF
         chunk_ending = rfile.readline(3)
@@ -643,6 +642,7 @@ def post_pages(
     timeout_seconds: int,
     file_field: str,
     include_meta_fields: bool,
+    send_all_pages: bool,
     job_id: str,
     meta: Dict[str, str],
     total_pages: int,
@@ -652,20 +652,25 @@ def post_pages(
     if auth_header and auth_value:
         headers[auth_header] = auth_value
 
-    # Single request, only the first page PNG.
     if not png_pages:
         logger.warning("Skipping upload: no PNG pages to POST for job_id=%s", job_id)
         return
 
-    page_num = 1 if 1 in png_pages else sorted(png_pages.keys())[0]
-    png_bytes = png_pages[page_num]
+    page_numbers = sorted(png_pages.keys())
+    if not send_all_pages:
+        page_numbers = [1 if 1 in png_pages else page_numbers[0]]
+
+    page_label = str(page_numbers[0]) if len(page_numbers) == 1 else f"{page_numbers[0]}-{page_numbers[-1]}"
+    total_png_bytes = sum(len(png_pages[page_num]) for page_num in page_numbers)
     logger.info(
-        "POST start: endpoint=%s job_id=%s page=%s total_pages=%s png_bytes=%d",
+        "POST start: endpoint=%s job_id=%s pages=%s file_parts=%s total_pages=%s png_bytes=%d mode=%s",
         endpoint,
         job_id,
-        page_num,
+        page_label,
+        len(page_numbers),
         total_pages,
-        len(png_bytes),
+        total_png_bytes,
+        "all-pages-single-post" if send_all_pages else "first-page-only",
     )
 
     data = {}
@@ -673,28 +678,36 @@ def post_pages(
         data = {
             "job_id": job_id,
             "request_id": meta.get("request_id", ""),
-            "page": str(page_num),
             "total_pages": str(total_pages),
             "document_format": meta.get("document-format", ""),
             "job_name": meta.get("job-name", ""),
             "printer_uri": meta.get("printer-uri", ""),
             "user": meta.get("requesting-user-name", ""),
         }
-    files = {
-        (file_field or "file"): (
-            f"{job_id}_p{page_num}.png",
-            png_bytes,
-            "image/png",
+        if len(page_numbers) == 1:
+            data["page"] = str(page_numbers[0])
+
+    files = [
+        (
+            file_field or "file",
+            (
+                f"{job_id}_p{page_num}.png",
+                png_pages[page_num],
+                "image/png",
+            ),
         )
-    }
+        for page_num in page_numbers
+    ]
+
     try:
         resp = requests.post(endpoint, data=data, files=files, headers=headers, timeout=timeout_seconds)
         logger.info(
-            "POST response: endpoint=%s status=%s job_id=%s page=%s",
+            "POST response: endpoint=%s status=%s job_id=%s pages=%s file_parts=%s",
             endpoint,
             resp.status_code,
             job_id,
-            page_num,
+            page_label,
+            len(page_numbers),
         )
         if resp.status_code >= 400:
             try:
@@ -706,10 +719,10 @@ def post_pages(
             if body:
                 logger.warning("POST response body: %s", body)
         resp.raise_for_status()
-        logger.info("POST succeeded: endpoint=%s job_id=%s page=%s", endpoint, job_id, page_num)
+        logger.info("POST succeeded: endpoint=%s job_id=%s pages=%s", endpoint, job_id, page_label)
     except Exception:
         # Never crash the server thread on upload failures.
-        logger.exception("Upload failed: endpoint=%s job_id=%s page=%s", endpoint, job_id, page_num)
+        logger.exception("Upload failed: endpoint=%s job_id=%s pages=%s", endpoint, job_id, page_label)
 
 
 class IppHandler(BaseHTTPRequestHandler):
@@ -793,7 +806,8 @@ class IppHandler(BaseHTTPRequestHandler):
                 self.send_error(401)
                 return
 
-        # Some clients (incl. macOS printing stack) use Expect: 100-continue.
+        # Some proxy paths mis-handle an origin-generated 100-continue response.
+        # Default to suppressing it unless explicitly re-enabled.
         if (self.headers.get("Expect") or "").lower() == "100-continue":
             if config.get("IPP_SEND_EXPECT_CONTINUE", True):
                 logger.debug("Sending 100-continue")
@@ -1087,6 +1101,7 @@ class IppHandler(BaseHTTPRequestHandler):
                             "timeout_seconds": config["POST_TIMEOUT_SECONDS"],
                             "file_field": config.get("POST_FILE_FIELD", "file"),
                             "include_meta_fields": bool(config.get("POST_INCLUDE_META_FIELDS", True)),
+                            "send_all_pages": bool(config.get("POST_SEND_ALL_PAGES", False)),
                             "job_id": upload_job_id,
                             "meta": meta,
                             "total_pages": total,
@@ -1222,6 +1237,7 @@ class IppHandler(BaseHTTPRequestHandler):
                         "timeout_seconds": config["POST_TIMEOUT_SECONDS"],
                         "file_field": config.get("POST_FILE_FIELD", "file"),
                         "include_meta_fields": bool(config.get("POST_INCLUDE_META_FIELDS", True)),
+                        "send_all_pages": bool(config.get("POST_SEND_ALL_PAGES", False)),
                         "job_id": job_id,
                         "meta": meta,
                         "total_pages": total,
@@ -1358,7 +1374,7 @@ def main() -> None:
         "IPP_SPOOL_DIR": _env_str("IPP_SPOOL_DIR", "./spool"),
         "IPP_RENDER_DPI": _env_int("IPP_RENDER_DPI", 150),
         "IPP_TEMP_DIR": _env_str("IPP_TEMP_DIR", "./temp"),
-        "IPP_SEND_EXPECT_CONTINUE": _env_bool("IPP_SEND_EXPECT_CONTINUE", True),
+        "IPP_SEND_EXPECT_CONTINUE": _env_bool("IPP_SEND_EXPECT_CONTINUE", False),
         "IPP_SHARED_TOKEN": os.getenv("IPP_SHARED_TOKEN") or "",
         "PAPER_ID": os.getenv("PAPER_ID") or "",
         "POST_ENDPOINT": _env_str("POST_ENDPOINT", ""),
@@ -1367,6 +1383,7 @@ def main() -> None:
         "POST_TIMEOUT_SECONDS": _env_int("POST_TIMEOUT_SECONDS", 30),
         "POST_FILE_FIELD": _env_str("POST_FILE_FIELD", "file"),
         "POST_INCLUDE_META_FIELDS": _env_bool("POST_INCLUDE_META_FIELDS", True),
+        "POST_SEND_ALL_PAGES": _env_bool("POST_SEND_ALL_PAGES", False),
     }
 
     config["LOG_HEADERS"] = _env_bool("LOG_HEADERS", False)

@@ -15,6 +15,7 @@ primary_region = 'fra'
   POST_AUTH_HEADER = 'x-api-key'
   POST_TIMEOUT_SECONDS= '30'
   POST_FILE_FIELD= 'picture'
+  POST_SEND_ALL_PAGES = 'false'
 
 [http_service]
   internal_port = 8080

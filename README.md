@@ -36,6 +36,7 @@ Server defaults to `http://0.0.0.0:8631/ipp/print`.
 - This is a **minimal** IPP implementation focused on `Print-Job` payload extraction.
 - PDF jobs work out of the box. PostScript jobs from Generic IPP/PostScript drivers require Ghostscript on the server host for direct raster rendering.
 - For internet exposure, run behind a reverse proxy (Caddy/Nginx) for TLS.
+- If clients send `Expect: 100-continue`, keep `IPP_SEND_EXPECT_CONTINUE=false` unless you have verified your proxy path handles an origin-generated `100 Continue` correctly.
 - Set `IPP_SHARED_TOKEN` if you want a simple shared-secret header gate.
 - The first rendered PNG is also written to `IPP_TEMP_DIR` (default `./temp`).
 - Optional auto-restart on crash:
@@ -57,18 +58,22 @@ If you use a Generic PostScript / plain IPP driver on macOS, install Ghostscript
 
 ## Outbound POST format
 
-If `POST_ENDPOINT` is set, the server sends **a single** `multipart/form-data` POST containing **only the first page** rendered as PNG.
+If `POST_ENDPOINT` is set, the server sends **a single** `multipart/form-data` POST containing **only the first page** rendered as PNG by default.
+If `POST_SEND_ALL_PAGES=true`, it instead sends **one multipart/form-data POST containing all rendered pages**, in page order.
 If `POST_ENDPOINT` is empty, the server runs in **store-only mode** (no upload).
 
-- optional fields (enabled by default): `job_id`, `request_id`, `page`, `total_pages`, `document_format`, `job_name`, `printer_uri`, `user`
-- file: field name configurable via `POST_FILE_FIELD` (default: `file`)
+- optional fields (enabled by default): `job_id`, `request_id`, `total_pages`, `document_format`, `job_name`, `printer_uri`, `user`
+- optional field for single-page uploads: `page`
+- file: field name configurable via `POST_FILE_FIELD` (default: `file`); with `POST_SEND_ALL_PAGES=true`, the multipart body repeats that same file field once per page
 
 Configured via `.env`:
 
+- `IPP_SEND_EXPECT_CONTINUE`
 - `POST_ENDPOINT`
 - `POST_AUTH_HEADER` + `POST_AUTH_VALUE`
 - `POST_FILE_FIELD`
 - `POST_INCLUDE_META_FIELDS`
+- `POST_SEND_ALL_PAGES`
 
 To enable uploading, set `POST_ENDPOINT` (e.g. `https://api.memo.wirewire.de/print/`).
 
@@ -94,6 +99,7 @@ Full example:
 - `POST_AUTH_VALUE=<token>`
 - `POST_FILE_FIELD=picture`
 - `POST_INCLUDE_META_FIELDS=false`
+- `POST_SEND_ALL_PAGES=false`
 
 ![Integration in paperlesspaper App](./docs/paperlessprinter-app.png)
 

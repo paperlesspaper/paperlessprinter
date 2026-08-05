@@ -1,3 +1,4 @@
+import io
 import shutil
 import struct
 import subprocess
@@ -6,6 +7,7 @@ import unittest
 from pathlib import Path
 
 import fitz
+from PIL import Image
 
 import server
 
@@ -27,7 +29,7 @@ class RoutingTests(unittest.TestCase):
             "POST /ipp/print/paper-123/<redacted> HTTP/1.1",
         )
 
-    def test_windows_base_path_recovers_full_forwarded_ipps_uri(self):
+    def test_windows_https_discovery_is_advertised_as_full_ipps_uri(self):
         headers = {
             "Host": "paperlesspaper-print:8631",
             "X-Forwarded-Host": "print.paperlesspaper.de",
@@ -38,7 +40,7 @@ class RoutingTests(unittest.TestCase):
             headers,
             "/ipp/print",
             "/ipp/print",
-            "ipps://print.paperlesspaper.de/ipp/print/paper-123/secret-token",
+            "https://print.paperlesspaper.de/ipp/print/paper-123/secret-token",
         )
 
         self.assertEqual(
@@ -108,8 +110,115 @@ class IppParsingTests(unittest.TestCase):
         self.assertIn(b"ipp-versions-supported", response)
         self.assertIn(b"media-col-database", response)
 
+    def test_target_profile_advertises_only_its_exact_custom_media(self):
+        profile = server._parse_target_profiles(
+            '{"paper-123":{"width":1600,"height":1200}}'
+        )["paper-123"]
+
+        response = server.build_get_printer_attributes_response(
+            "print.example",
+            "/ipp/print/paper-123/secret-token",
+            scheme="ipps",
+            target_profile=profile,
+            render_dpi=150,
+        )
+
+        self.assertIn(b"custom_1600x1200_270.93x203.20mm", response)
+        self.assertIn(struct.pack(">i", 27093), response)
+        self.assertIn(struct.pack(">i", 20320), response)
+        self.assertNotIn(b"iso_a4_210x297mm", response)
+
+
+class TargetProfileTests(unittest.TestCase):
+    def test_profiles_are_validated_and_support_a_fallback(self):
+        profiles = server._parse_target_profiles(
+            """{
+                "paper-large": {"width": 1600, "height": 1200},
+                "*": {
+                    "width": 800,
+                    "height": 480,
+                    "fit": "cover",
+                    "auto_rotate": false,
+                    "background": "#eeeeee"
+                }
+            }"""
+        )
+
+        large = server._target_profile_for_paper_id(profiles, "paper-large")
+        fallback = server._target_profile_for_paper_id(profiles, "unknown-paper")
+
+        self.assertEqual((large["width"], large["height"]), (1600, 1200))
+        self.assertEqual(large["fit"], "contain")
+        self.assertTrue(large["auto_rotate"])
+        self.assertEqual((fallback["width"], fallback["height"]), (800, 480))
+        self.assertEqual(fallback["fit"], "cover")
+
+    def test_invalid_profiles_fail_fast(self):
+        invalid_profiles = [
+            '[]',
+            '{"paper":{"width":0,"height":480}}',
+            '{"paper":{"width":800,"height":480,"fit":"unknown"}}',
+            '{"paper":{"width":800,"height":480,"auto_rotate":"yes"}}',
+        ]
+        for raw in invalid_profiles:
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                server._parse_target_profiles(raw)
+
 
 class RenderingTests(unittest.TestCase):
+    @staticmethod
+    def _png(width, height, color):
+        output = io.BytesIO()
+        Image.new("RGB", (width, height), color).save(output, format="PNG")
+        return output.getvalue()
+
+    def test_contain_produces_exact_canvas_with_centered_background(self):
+        profile = {
+            "width": 800,
+            "height": 480,
+            "fit": "contain",
+            "auto_rotate": True,
+            "background": "#ffffff",
+        }
+
+        result = server.fit_png_to_target(self._png(400, 400, "#ff0000"), profile)
+
+        with Image.open(io.BytesIO(result)) as image:
+            self.assertEqual(image.size, (800, 480))
+            self.assertEqual(image.getpixel((0, 0)), (255, 255, 255))
+            self.assertEqual(image.getpixel((400, 240)), (255, 0, 0))
+
+    def test_auto_rotate_uses_the_target_orientation(self):
+        profile = {
+            "width": 800,
+            "height": 480,
+            "fit": "contain",
+            "auto_rotate": True,
+            "background": "#ffffff",
+        }
+
+        result = server.fit_png_to_target(self._png(480, 800, "#00ff00"), profile)
+
+        with Image.open(io.BytesIO(result)) as image:
+            self.assertEqual(image.size, (800, 480))
+            self.assertEqual(image.getpixel((0, 0)), (0, 255, 0))
+            self.assertEqual(image.getpixel((799, 479)), (0, 255, 0))
+
+    def test_cover_and_stretch_produce_both_supported_device_sizes(self):
+        source = self._png(640, 480, "#0000ff")
+        for width, height, fit in [(1600, 1200, "cover"), (800, 480, "stretch")]:
+            with self.subTest(width=width, height=height, fit=fit):
+                profile = {
+                    "width": width,
+                    "height": height,
+                    "fit": fit,
+                    "auto_rotate": True,
+                    "background": "#ffffff",
+                }
+                result = server.fit_png_to_target(source, profile)
+                with Image.open(io.BytesIO(result)) as image:
+                    self.assertEqual(image.size, (width, height))
+
     def test_pwg_raster_round_trip_when_cups_filters_are_available(self):
         cupsfilter = shutil.which("cupsfilter")
         converter = server._pwg_raster_converter_command()

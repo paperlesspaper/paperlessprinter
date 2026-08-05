@@ -46,10 +46,17 @@ Server defaults to `http://0.0.0.0:8631/ipp/print`.
 
 ## Printer setup
 
-Always use the complete per-printer URL when one is supplied:
+Always use the complete per-printer URL when one is supplied. CUPS and macOS use
+the IPP service URI form:
 
 ```text
 ipps://print.example/ipp/print/<paper-id>/<token>
+```
+
+Windows directed discovery uses the HTTPS transport form of the same endpoint:
+
+```text
+https://print.example/ipp/print/<paper-id>/<token>
 ```
 
 The token is a credential. Do not paste it into public logs or screenshots. The server redacts it from new request-path log entries.
@@ -62,11 +69,16 @@ In an elevated PowerShell window:
 
 ```powershell
 Get-Printer -Name "paperlesspaper" -ErrorAction SilentlyContinue | Remove-Printer
-Add-Printer -Name "paperlesspaper" -IppURL "ipps://print.example/ipp/print/<paper-id>/<token>"
+Restart-Service Spooler
+Add-Printer -Name "paperlesspaper" -IppURL "https://print.example/ipp/print/<paper-id>/<token>"
 Get-Printer -Name "paperlesspaper" | Format-List Name,DriverName,PortName,PrinterStatus
 ```
 
-The driver should be **Microsoft IPP Class Driver**. You can also use **Settings → Bluetooth & devices → Printers & scanners → Add device → Add manually**, choose an IPP printer, and enter the same full IPPS URL.
+The driver should be **Microsoft IPP Class Driver**. A generated `WSD-...` port
+name is normal for Windows directed discovery. You can also use **Settings →
+Bluetooth & devices → Printers & scanners → Add device → Add manually**, choose
+an IPP printer, and enter the same full HTTPS URL. `Add-Printer -IppURL` rejects
+the `ipps://` form before contacting the server on affected Windows versions.
 
 For Windows-side diagnostics, enable and inspect the print service event log:
 
@@ -114,7 +126,7 @@ If `POST_ENDPOINT` is set, the server sends **a single** `multipart/form-data` P
 If `POST_SEND_ALL_PAGES=true`, it instead sends **one multipart/form-data POST containing all rendered pages**, in page order.
 If `POST_ENDPOINT` is empty, the server runs in **store-only mode** (no upload).
 
-- optional fields (enabled by default): `job_id`, `request_id`, `total_pages`, `document_format`, `job_name`, `printer_uri`, `user`
+- optional fields (disabled by default): `job_id`, `request_id`, `total_pages`, `document_format`, `job_name`, `printer_uri`, `user`
 - optional field for single-page uploads: `page`
 - file: field name configurable via `POST_FILE_FIELD` (default: `file`); with `POST_SEND_ALL_PAGES=true`, the multipart body repeats that same file field once per page
 
@@ -171,6 +183,29 @@ It also recovers those values from the IPP `printer-uri` attribute when a client
 
 - If `POST_ENDPOINT` contains one of these placeholders, it is replaced: `<paperId>`, `{PAPER_ID}`, `{paper_id}`.
 - Otherwise, if `paper_id` is set, it is appended as the final path segment: `POST_ENDPOINT.rstrip('/') + '/' + paper_id`.
+
+#### Exact output sizes per device
+
+Use `IPP_TARGET_PROFILES` to assign an exact pixel canvas to each paper ID. The server advertises a matching custom media size during IPP discovery and normalizes every uploaded PNG to the configured dimensions.
+
+```env
+IPP_RENDER_DPI=150
+IPP_TARGET_PROFILES={"paper-id-one":{"width":1600,"height":1200,"fit":"contain"},"paper-id-two":{"width":800,"height":480,"fit":"contain","auto_rotate":true,"background":"#ffffff"}}
+```
+
+Profile options:
+
+- `width` and `height` are required positive pixel dimensions.
+- `fit=contain` is the default and preserves the complete page, adding the configured background where needed.
+- `fit=cover` fills the display and center-crops overflow.
+- `fit=stretch` fills the display without cropping but can distort the page.
+- `auto_rotate=true` is the default and rotates portrait/landscape content when that is a better match for the target.
+- `background=#ffffff` is the default padding color for `contain`.
+- A profile keyed by `"*"` is used as an optional fallback when no exact paper ID matches.
+
+At 150 dpi, a 1600×1200 profile is advertised as approximately 270.93×203.20 mm and an 800×480 profile as approximately 135.47×81.28 mm. This makes a driverless client generate the intended raster dimensions; the final server-side normalization still guarantees the exact configured pixel size.
+
+Windows, macOS, and CUPS cache printer capabilities. Remove and re-add an existing printer after changing its profile so the print dialog receives the new custom media size.
 
 ### Quick upload test (no printing)
 

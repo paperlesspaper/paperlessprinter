@@ -1,5 +1,6 @@
 import datetime as _dt
 import hashlib
+import io
 import json
 import logging
 import os
@@ -18,10 +19,12 @@ from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 import fitz  # PyMuPDF
 import requests
 from dotenv import load_dotenv
+from PIL import Image, ImageColor, ImageOps
 
 
 logger = logging.getLogger("ipp")
 _PROCESS_STARTED_MONOTONIC = time.monotonic()
+_MAX_TARGET_PIXELS = 100_000_000
 
 
 def _utc_timestamp_compact() -> str:
@@ -214,6 +217,87 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None or value == "":
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_target_profiles(raw: str) -> Dict[str, Dict[str, object]]:
+    """Parse and validate per-paper output profiles from JSON."""
+    if not (raw or "").strip():
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"IPP_TARGET_PROFILES must be valid JSON: {exc}") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError("IPP_TARGET_PROFILES must be a JSON object keyed by paper ID")
+
+    profiles: Dict[str, Dict[str, object]] = {}
+    for raw_paper_id, raw_profile in decoded.items():
+        paper_id = str(raw_paper_id).strip()
+        if not paper_id:
+            raise ValueError("IPP_TARGET_PROFILES contains an empty paper ID")
+        if not isinstance(raw_profile, dict):
+            raise ValueError(f"Target profile {paper_id!r} must be a JSON object")
+
+        raw_width = raw_profile.get("width")
+        raw_height = raw_profile.get("height")
+        if isinstance(raw_width, bool) or isinstance(raw_height, bool):
+            raise ValueError(f"Target profile {paper_id!r} width/height must be integers")
+        try:
+            width = int(raw_width)
+            height = int(raw_height)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Target profile {paper_id!r} width/height must be integers") from exc
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Target profile {paper_id!r} width/height must be positive")
+        if width > 20_000 or height > 20_000 or width * height > _MAX_TARGET_PIXELS:
+            raise ValueError(f"Target profile {paper_id!r} dimensions are too large")
+
+        fit = str(raw_profile.get("fit", "contain")).strip().lower()
+        if fit not in {"contain", "cover", "stretch"}:
+            raise ValueError(f"Target profile {paper_id!r} fit must be contain, cover, or stretch")
+
+        auto_rotate = raw_profile.get("auto_rotate", True)
+        if not isinstance(auto_rotate, bool):
+            raise ValueError(f"Target profile {paper_id!r} auto_rotate must be true or false")
+
+        background = str(raw_profile.get("background", "#ffffff")).strip()
+        try:
+            background_rgb = ImageColor.getrgb(background)
+        except ValueError as exc:
+            raise ValueError(f"Target profile {paper_id!r} has an invalid background color") from exc
+        if len(background_rgb) != 3:
+            raise ValueError(f"Target profile {paper_id!r} background must be an opaque color")
+
+        profiles[paper_id] = {
+            "width": width,
+            "height": height,
+            "fit": fit,
+            "auto_rotate": auto_rotate,
+            "background": background,
+        }
+    return profiles
+
+
+def _target_profile_for_paper_id(
+    profiles: Dict[str, Dict[str, object]], paper_id: str
+) -> Optional[Dict[str, object]]:
+    profile = profiles.get((paper_id or "").strip()) or profiles.get("*")
+    return dict(profile) if profile else None
+
+
+def _target_media_definition(profile: Dict[str, object], dpi: int) -> Tuple[str, list[Tuple[str, int, object]]]:
+    width = int(profile["width"])
+    height = int(profile["height"])
+    effective_dpi = max(1, int(dpi))
+    width_hundredths_mm = max(1, round(width * 2540 / effective_dpi))
+    height_hundredths_mm = max(1, round(height * 2540 / effective_dpi))
+    width_mm = width_hundredths_mm / 100
+    height_mm = height_hundredths_mm / 100
+    media_name = f"custom_{width}x{height}_{width_mm:.2f}x{height_mm:.2f}mm"
+    return media_name, [
+        ("x-dimension", VT_INTEGER, width_hundredths_mm),
+        ("y-dimension", VT_INTEGER, height_hundredths_mm),
+    ]
 
 
 def _redacted_headers(headers) -> Dict[str, str]:
@@ -641,6 +725,7 @@ def build_get_printer_attributes_response(
     printer_uri: str = "",
     requested_attributes: Optional[list[str]] = None,
     render_dpi: int = 150,
+    target_profile: Optional[Dict[str, object]] = None,
 ) -> bytes:
     host = host_header or "127.0.0.1"
     canonical_uri = printer_uri or f"{scheme}://{host}{ipp_path}"
@@ -663,6 +748,20 @@ def build_get_printer_attributes_response(
         ("x-dimension", VT_INTEGER, 21590),
         ("y-dimension", VT_INTEGER, 27940),
     ]
+    if target_profile:
+        target_media_name, target_size = _target_media_definition(target_profile, render_dpi)
+        media_definitions = [(target_media_name, target_size)]
+        printer_info = (
+            f"paperlesspaper {int(target_profile['width'])}x{int(target_profile['height'])} "
+            "virtual IPP printer"
+        )
+    else:
+        media_definitions = [
+            ("iso_a4_210x297mm", a4_size),
+            ("na_letter_8.5x11in", letter_size),
+        ]
+        printer_info = "paperlesspaper virtual IPP printer"
+    default_media_name, default_media_size = media_definitions[0]
 
     def media_col(size: list[Tuple[str, int, object]], media_name: str) -> list[Tuple[str, int, object]]:
         return [
@@ -685,7 +784,7 @@ def build_get_printer_attributes_response(
     add("uri-authentication-supported", _ipp_attr_str(VT_KEYWORD, "uri-authentication-supported", "none"))
     add("uri-security-supported", _ipp_attr_str(VT_KEYWORD, "uri-security-supported", security))
     add("printer-name", _ipp_attr_str(VT_NAME_WITHOUT_LANGUAGE, "printer-name", "paperlesspaper"))
-    add("printer-info", _ipp_attr_str(VT_TEXT_WITHOUT_LANGUAGE, "printer-info", "paperlesspaper virtual IPP printer"))
+    add("printer-info", _ipp_attr_str(VT_TEXT_WITHOUT_LANGUAGE, "printer-info", printer_info))
     add("printer-location", _ipp_attr_str(VT_TEXT_WITHOUT_LANGUAGE, "printer-location", "Cloud"))
     add("printer-geo-location", _ipp_attr_str(VT_URI, "printer-geo-location", "geo:0,0"))
     add("printer-make-and-model", _ipp_attr_str(VT_TEXT_WITHOUT_LANGUAGE, "printer-make-and-model", "paperlesspaper IPP Printer"))
@@ -775,20 +874,32 @@ def build_get_printer_attributes_response(
     add("copies-supported", _ipp_attr_range("copies-supported", 1, 1))
     add("finishings-default", _ipp_attr_i32(VT_ENUM, "finishings-default", 3))
     add("finishings-supported", _ipp_attr_i32(VT_ENUM, "finishings-supported", 3))
-    add("media-default", _ipp_attr_str(VT_KEYWORD, "media-default", "iso_a4_210x297mm"))
-    add("media-supported", _ipp_attr_str_set(VT_KEYWORD, "media-supported", ["iso_a4_210x297mm", "na_letter_8.5x11in"]))
-    add("media-ready", _ipp_attr_str(VT_KEYWORD, "media-ready", "iso_a4_210x297mm"))
-    add("media-col-default", _ipp_collection("media-col-default", media_col(a4_size, "iso_a4_210x297mm")))
-    add("media-col-ready", _ipp_collection("media-col-ready", media_col(a4_size, "iso_a4_210x297mm")))
+    add("media-default", _ipp_attr_str(VT_KEYWORD, "media-default", default_media_name))
+    add(
+        "media-supported",
+        _ipp_attr_str_set(VT_KEYWORD, "media-supported", [name for name, _ in media_definitions]),
+    )
+    add("media-ready", _ipp_attr_str(VT_KEYWORD, "media-ready", default_media_name))
+    add(
+        "media-col-default",
+        _ipp_collection("media-col-default", media_col(default_media_size, default_media_name)),
+    )
+    add(
+        "media-col-ready",
+        _ipp_collection("media-col-ready", media_col(default_media_size, default_media_name)),
+    )
     add(
         "media-col-database",
         _ipp_collection_set(
             "media-col-database",
-            [media_col(a4_size, "iso_a4_210x297mm"), media_col(letter_size, "na_letter_8.5x11in")],
+            [media_col(size, name) for name, size in media_definitions],
         ),
     )
     add("media-col-supported", _ipp_attr_str_set(VT_KEYWORD, "media-col-supported", ["media-size", "media-source", "media-type", "media-bottom-margin", "media-left-margin", "media-right-margin", "media-top-margin"]))
-    add("media-size-supported", _ipp_collection_set("media-size-supported", [a4_size, letter_size]))
+    add(
+        "media-size-supported",
+        _ipp_collection_set("media-size-supported", [size for _, size in media_definitions]),
+    )
     for margin in ("bottom", "left", "right", "top"):
         name = f"media-{margin}-margin-supported"
         add(name, _ipp_attr_i32(VT_INTEGER, name, 0))
@@ -1094,6 +1205,95 @@ def render_document_to_pngs(document: bytes, meta: Dict[str, str], dpi: int) -> 
     raise ValueError(f"Unsupported document payload (first bytes={document[:12]!r})")
 
 
+def _should_rotate_for_target(source_size: Tuple[int, int], target_size: Tuple[int, int]) -> bool:
+    source_width, source_height = source_size
+    target_width, target_height = target_size
+    if source_width <= 0 or source_height <= 0 or target_width <= 0 or target_height <= 0:
+        return False
+    source_ratio = source_width / source_height
+    rotated_ratio = source_height / source_width
+    target_ratio = target_width / target_height
+    normal_error = abs(source_ratio - target_ratio) / target_ratio
+    rotated_error = abs(rotated_ratio - target_ratio) / target_ratio
+    return rotated_error + 1e-9 < normal_error
+
+
+def fit_png_to_target(png_bytes: bytes, profile: Dict[str, object]) -> bytes:
+    width = int(profile["width"])
+    height = int(profile["height"])
+    fit = str(profile.get("fit", "contain"))
+    auto_rotate = bool(profile.get("auto_rotate", True))
+    background = ImageColor.getrgb(str(profile.get("background", "#ffffff")))
+
+    with Image.open(io.BytesIO(png_bytes)) as source:
+        if source.mode in {"RGBA", "LA"} or "transparency" in source.info:
+            foreground = source.convert("RGBA")
+            composite = Image.new("RGBA", foreground.size, (*background, 255))
+            composite.alpha_composite(foreground)
+            image = composite.convert("RGB")
+        else:
+            image = source.convert("RGB")
+        if auto_rotate and _should_rotate_for_target(image.size, (width, height)):
+            image = image.transpose(Image.Transpose.ROTATE_270)
+
+        if fit == "cover":
+            output = ImageOps.fit(
+                image,
+                (width, height),
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+        elif fit == "stretch":
+            output = image.resize((width, height), Image.Resampling.LANCZOS)
+        else:
+            fitted = ImageOps.contain(image, (width, height), Image.Resampling.LANCZOS)
+            output = Image.new("RGB", (width, height), background)
+            output.paste(
+                fitted,
+                ((width - fitted.width) // 2, (height - fitted.height) // 2),
+            )
+
+        encoded = io.BytesIO()
+        output.save(encoded, format="PNG")
+        return encoded.getvalue()
+
+
+def apply_target_profile_to_pages(
+    pages: Dict[int, bytes], profile: Optional[Dict[str, object]], meta: Dict[str, str]
+) -> Dict[int, bytes]:
+    if not profile:
+        return pages
+
+    width = int(profile["width"])
+    height = int(profile["height"])
+    fit = str(profile.get("fit", "contain"))
+    meta["target-width"] = str(width)
+    meta["target-height"] = str(height)
+    meta["target-fit"] = fit
+    logger.info(
+        "Fitting rendered pages to target: size=%sx%s fit=%s auto_rotate=%s background=%s",
+        width,
+        height,
+        fit,
+        bool(profile.get("auto_rotate", True)),
+        profile.get("background", "#ffffff"),
+    )
+    return {
+        page_number: fit_png_to_target(png_bytes, profile)
+        for page_number, png_bytes in pages.items()
+    }
+
+
+def render_document_for_target(
+    document: bytes,
+    meta: Dict[str, str],
+    dpi: int,
+    target_profile: Optional[Dict[str, object]],
+) -> Tuple[int, Dict[int, bytes]]:
+    total, pages = render_document_to_pngs(document, meta, dpi=dpi)
+    return total, apply_target_profile_to_pages(pages, target_profile, meta)
+
+
 def store_first_png_in_temp(temp_dir: str, job_id: str, page_num: int, png_bytes: bytes) -> None:
     if not temp_dir:
         return
@@ -1151,6 +1351,10 @@ def post_pages(
             "printer_uri": meta.get("printer-uri", ""),
             "user": meta.get("requesting-user-name", ""),
         }
+        if meta.get("target-width") and meta.get("target-height"):
+            data["target_width"] = meta["target-width"]
+            data["target_height"] = meta["target-height"]
+            data["target_fit"] = meta.get("target-fit", "")
         if len(page_numbers) == 1:
             data["page"] = str(page_numbers[0])
 
@@ -1389,6 +1593,10 @@ class IppHandler(BaseHTTPRequestHandler):
         )
         effective_paper_id = (overrides.get("paper_id") or "").strip()
         effective_auth_value = (overrides.get("auth_value") or "").strip()
+        target_profile = _target_profile_for_paper_id(
+            config.get("IPP_TARGET_PROFILES") or {},
+            effective_paper_id,
+        )
         effective_endpoint = _resolve_endpoint_template(config.get("POST_ENDPOINT") or "", effective_paper_id)
         post_enabled = bool(effective_endpoint and effective_paper_id)
         external_printer_uri = _external_ipp_uri(
@@ -1430,6 +1638,7 @@ class IppHandler(BaseHTTPRequestHandler):
                 printer_uri=external_printer_uri,
                 requested_attributes=requested_attributes,
                 render_dpi=config["IPP_RENDER_DPI"],
+                target_profile=target_profile,
             )
             response = build_ipp_response_with_version(vmaj, vmin, IPP_STATUS_SUCCESSFUL_OK, request_id, attr_bytes)
             self.send_response(200)
@@ -1662,6 +1871,10 @@ class IppHandler(BaseHTTPRequestHandler):
                     effective_auth_value = (job_overrides.get("auth_value") or "").strip()
 
             # Recompute endpoint/post_enabled now that we may have effective_paper_id.
+            target_profile = _target_profile_for_paper_id(
+                config.get("IPP_TARGET_PROFILES") or {},
+                effective_paper_id,
+            )
             effective_endpoint = _resolve_endpoint_template(config.get("POST_ENDPOINT") or "", effective_paper_id)
             post_enabled = bool(effective_endpoint)
 
@@ -1707,7 +1920,16 @@ class IppHandler(BaseHTTPRequestHandler):
                 return
 
             try:
-                total, pages = render_document_to_pngs(document, meta, dpi=config["IPP_RENDER_DPI"])
+                total, pages = render_document_for_target(
+                    document,
+                    meta,
+                    dpi=config["IPP_RENDER_DPI"],
+                    target_profile=target_profile,
+                )
+                (spool_dir / "meta.json").write_text(
+                    json.dumps(meta, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
                 for page_num, png_bytes in pages.items():
                     (spool_dir / f"page_{page_num:04d}.png").write_bytes(png_bytes)
                 logger.info(
@@ -1742,7 +1964,7 @@ class IppHandler(BaseHTTPRequestHandler):
                             "auth_value": effective_auth_value,
                             "timeout_seconds": config["POST_TIMEOUT_SECONDS"],
                             "file_field": config.get("POST_FILE_FIELD", "file"),
-                            "include_meta_fields": bool(config.get("POST_INCLUDE_META_FIELDS", True)),
+                            "include_meta_fields": bool(config.get("POST_INCLUDE_META_FIELDS", False)),
                             "send_all_pages": bool(config.get("POST_SEND_ALL_PAGES", False)),
                             "job_id": upload_job_id,
                             "meta": meta,
@@ -1849,7 +2071,16 @@ class IppHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            total, pages = render_document_to_pngs(document, meta, dpi=config["IPP_RENDER_DPI"])
+            total, pages = render_document_for_target(
+                document,
+                meta,
+                dpi=config["IPP_RENDER_DPI"],
+                target_profile=target_profile,
+            )
+            (spool_dir / "meta.json").write_text(
+                json.dumps(meta, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
             for page_num, png_bytes in pages.items():
                 (spool_dir / f"page_{page_num:04d}.png").write_bytes(png_bytes)
             logger.info(
@@ -1883,7 +2114,7 @@ class IppHandler(BaseHTTPRequestHandler):
                         "auth_value": effective_auth_value,
                         "timeout_seconds": config["POST_TIMEOUT_SECONDS"],
                         "file_field": config.get("POST_FILE_FIELD", "file"),
-                        "include_meta_fields": bool(config.get("POST_INCLUDE_META_FIELDS", True)),
+                        "include_meta_fields": bool(config.get("POST_INCLUDE_META_FIELDS", False)),
                         "send_all_pages": bool(config.get("POST_SEND_ALL_PAGES", False)),
                         "job_id": job_id,
                         "meta": meta,
@@ -2052,6 +2283,7 @@ def main() -> None:
         "IPP_MAX_BYTES": _env_int("IPP_MAX_BYTES", 100 * 1024 * 1024),
         "IPP_SPOOL_DIR": _env_str("IPP_SPOOL_DIR", "./spool"),
         "IPP_RENDER_DPI": _env_int("IPP_RENDER_DPI", 150),
+        "IPP_TARGET_PROFILES": _parse_target_profiles(os.getenv("IPP_TARGET_PROFILES") or ""),
         "IPP_TEMP_DIR": _env_str("IPP_TEMP_DIR", "./temp"),
         "IPP_SEND_EXPECT_CONTINUE": _env_bool("IPP_SEND_EXPECT_CONTINUE", False),
         "IPP_SHARED_TOKEN": os.getenv("IPP_SHARED_TOKEN") or "",
@@ -2061,7 +2293,7 @@ def main() -> None:
         "POST_AUTH_VALUE": os.getenv("POST_AUTH_VALUE") or "",
         "POST_TIMEOUT_SECONDS": _env_int("POST_TIMEOUT_SECONDS", 30),
         "POST_FILE_FIELD": _env_str("POST_FILE_FIELD", "file"),
-        "POST_INCLUDE_META_FIELDS": _env_bool("POST_INCLUDE_META_FIELDS", True),
+        "POST_INCLUDE_META_FIELDS": _env_bool("POST_INCLUDE_META_FIELDS", False),
         "POST_SEND_ALL_PAGES": _env_bool("POST_SEND_ALL_PAGES", False),
     }
 

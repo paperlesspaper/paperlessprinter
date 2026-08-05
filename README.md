@@ -189,10 +189,10 @@ It also recovers those values from the IPP `printer-uri` attribute when a client
 The server always advertises these two selectable device sizes during IPP
 discovery:
 
-- **Open Paper L (13.3 inch)** — 1200×1600 pixels
-- **Open Paper L (13.3 inch) – Randlos** — 1200×1600 pixels, zero margins
-- **OpenPaper 7 (7.3 inch)** — 480×800 pixels
-- **OpenPaper 7 (7.3 inch) – Randlos** — 480×800 pixels, zero margins
+- **Open Paper L (13.3 inch)** — 202.69×270.26 mm, 1200×1600 pixels
+- **Open Paper L (13.3 inch) – Randlos** — 202.69×270.26 mm, 1200×1600 pixels, zero margins
+- **OpenPaper 7 (7.3 inch)** — 95.40×159.00 mm, 480×800 pixels
+- **OpenPaper 7 (7.3 inch) – Randlos** — 95.40×159.00 mm, 480×800 pixels, zero margins
 
 The normal variants advertise a 3 mm layout margin. The borderless variants
 advertise zero margins on all four sides and use a `.borderless` media name so
@@ -223,10 +223,11 @@ Profile options:
 - `background=#ffffff` is the default padding color for `contain`.
 - A profile keyed by `"*"` is used as an optional fallback when no exact paper ID matches.
 
-At 150 dpi, Open Paper L is advertised as approximately 203.20×270.93 mm and
-OpenPaper 7 as approximately 81.28×135.47 mm. This makes a driverless client
-generate the intended raster dimensions; final server-side normalization still
-guarantees the exact selected pixel size.
+The built-in physical media dimensions are calculated from each display's
+nominal diagonal and pixel aspect ratio. Open Paper L is therefore advertised
+as 202.69×270.26 mm (13.3 inches diagonally) and OpenPaper 7 as 95.40×159.00 mm
+(7.3 inches diagonally). Final server-side normalization still guarantees the
+exact selected pixel size.
 
 Windows, macOS, and CUPS cache printer capabilities. Remove and re-add an existing printer after changing its profile so the print dialog receives the new custom media size.
 

@@ -123,24 +123,24 @@ class IppParsingTests(unittest.TestCase):
             render_dpi=150,
         )
 
-        self.assertIn(b"custom_open-paper-l-13.3-inch_203.20x270.93mm", response)
+        self.assertIn(b"custom_open-paper-l-13.3-inch_202.69x270.26mm", response)
         self.assertIn(
-            b"custom_open-paper-l-13.3-inch.borderless_203.20x270.93mm",
+            b"custom_open-paper-l-13.3-inch.borderless_202.69x270.26mm",
             response,
         )
-        self.assertIn(b"custom_openpaper-7-7.3-inch_81.28x135.47mm", response)
+        self.assertIn(b"custom_openpaper-7-7.3-inch_95.40x159.00mm", response)
         self.assertIn(
-            b"custom_openpaper-7-7.3-inch.borderless_81.28x135.47mm",
+            b"custom_openpaper-7-7.3-inch.borderless_95.40x159.00mm",
             response,
         )
         self.assertIn(b"Open Paper L (13.3 inch)", response)
         self.assertIn(b"OpenPaper 7 (7.3 inch)", response)
         self.assertIn("Open Paper L (13.3 inch) – Randlos".encode(), response)
         self.assertIn("OpenPaper 7 (7.3 inch) – Randlos".encode(), response)
-        self.assertIn(struct.pack(">i", 27093), response)
-        self.assertIn(struct.pack(">i", 20320), response)
-        self.assertIn(struct.pack(">i", 13547), response)
-        self.assertIn(struct.pack(">i", 8128), response)
+        self.assertIn(struct.pack(">i", 27026), response)
+        self.assertIn(struct.pack(">i", 20269), response)
+        self.assertIn(struct.pack(">i", 15900), response)
+        self.assertIn(struct.pack(">i", 9540), response)
         self.assertNotIn(b"iso_a4_210x297mm", response)
         self.assertIn(
             server._ipp_attr_i32_set(
@@ -206,8 +206,8 @@ class IppParsingTests(unittest.TestCase):
 
         self.assertEqual(meta["media-key"], small_media)
         self.assertEqual(meta["media-size-name"], small_media)
-        self.assertEqual(meta["media-x-dimension"], "8128")
-        self.assertEqual(meta["media-y-dimension"], "13547")
+        self.assertEqual(meta["media-x-dimension"], "9540")
+        self.assertEqual(meta["media-y-dimension"], "15900")
         self.assertEqual(meta["orientation-requested"], "4")
         self.assertEqual((selected["width"], selected["height"]), (480, 800))
         self.assertTrue(selected["borderless"])
@@ -220,7 +220,7 @@ class IppParsingTests(unittest.TestCase):
 
         self.assertEqual(restored["paper_id"], "paper-123")
         self.assertEqual(restored["media-size-name"], small_media)
-        self.assertEqual(restored["media-x-dimension"], "8128")
+        self.assertEqual(restored["media-x-dimension"], "9540")
         self.assertEqual(restored["orientation-requested"], "4")
 
 

@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -32,6 +33,7 @@ _BUILT_IN_MEDIA_PROFILES = (
         "display_name": "Open Paper L (13.3 inch)",
         "width": 1200,
         "height": 1600,
+        "media_diagonal_inches": 13.3,
         "fit": "contain",
         "auto_rotate": False,
         "background": "#ffffff",
@@ -41,6 +43,7 @@ _BUILT_IN_MEDIA_PROFILES = (
         "display_name": "OpenPaper 7 (7.3 inch)",
         "width": 480,
         "height": 800,
+        "media_diagonal_inches": 7.3,
         "fit": "contain",
         "auto_rotate": False,
         "background": "#ffffff",
@@ -318,9 +321,15 @@ def _target_profile_for_paper_id(
 def _target_media_definition(profile: Dict[str, object], dpi: int) -> Tuple[str, list[Tuple[str, int, object]]]:
     width = int(profile["width"])
     height = int(profile["height"])
-    effective_dpi = max(1, int(dpi))
-    width_hundredths_mm = max(1, round(width * 2540 / effective_dpi))
-    height_hundredths_mm = max(1, round(height * 2540 / effective_dpi))
+    diagonal_inches = float(profile.get("media_diagonal_inches") or 0)
+    if diagonal_inches > 0:
+        scale = diagonal_inches * 2540 / math.hypot(width, height)
+        width_hundredths_mm = max(1, round(width * scale))
+        height_hundredths_mm = max(1, round(height * scale))
+    else:
+        effective_dpi = max(1, int(dpi))
+        width_hundredths_mm = max(1, round(width * 2540 / effective_dpi))
+        height_hundredths_mm = max(1, round(height * 2540 / effective_dpi))
     width_mm = width_hundredths_mm / 100
     height_mm = height_hundredths_mm / 100
     raw_media_id = str(profile.get("media_id") or f"{width}x{height}").strip().lower()

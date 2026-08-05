@@ -112,7 +112,7 @@ class IppParsingTests(unittest.TestCase):
 
     def test_advertises_both_named_open_paper_media_sizes(self):
         profile = server._parse_target_profiles(
-            '{"paper-123":{"width":800,"height":480}}'
+            '{"paper-123":{"width":480,"height":800}}'
         )["paper-123"]
 
         response = server.build_get_printer_attributes_response(
@@ -123,15 +123,33 @@ class IppParsingTests(unittest.TestCase):
             render_dpi=150,
         )
 
-        self.assertIn(b"custom_open-paper-l-13.3-inch_270.93x203.20mm", response)
-        self.assertIn(b"custom_openpaper-7-7.3-inch_135.47x81.28mm", response)
+        self.assertIn(b"custom_open-paper-l-13.3-inch_203.20x270.93mm", response)
+        self.assertIn(
+            b"custom_open-paper-l-13.3-inch.borderless_203.20x270.93mm",
+            response,
+        )
+        self.assertIn(b"custom_openpaper-7-7.3-inch_81.28x135.47mm", response)
+        self.assertIn(
+            b"custom_openpaper-7-7.3-inch.borderless_81.28x135.47mm",
+            response,
+        )
         self.assertIn(b"Open Paper L (13.3 inch)", response)
         self.assertIn(b"OpenPaper 7 (7.3 inch)", response)
+        self.assertIn("Open Paper L (13.3 inch) – Randlos".encode(), response)
+        self.assertIn("OpenPaper 7 (7.3 inch) – Randlos".encode(), response)
         self.assertIn(struct.pack(">i", 27093), response)
         self.assertIn(struct.pack(">i", 20320), response)
         self.assertIn(struct.pack(">i", 13547), response)
         self.assertIn(struct.pack(">i", 8128), response)
         self.assertNotIn(b"iso_a4_210x297mm", response)
+        self.assertIn(
+            server._ipp_attr_i32_set(
+                server.VT_INTEGER,
+                "media-left-margin-supported",
+                [0, server._STANDARD_MEDIA_MARGIN],
+            ),
+            response,
+        )
 
         small_media, _ = server._target_media_definition(
             server._selectable_target_profiles(profile)[0],
@@ -144,7 +162,11 @@ class IppParsingTests(unittest.TestCase):
 
     def test_media_col_selection_drives_exact_target_profile(self):
         profiles = server._selectable_target_profiles()
-        small_profile = next(profile for profile in profiles if profile["width"] == 800)
+        small_profile = next(
+            profile
+            for profile in profiles
+            if profile["width"] == 480 and profile["borderless"]
+        )
         small_media, small_size = server._target_media_definition(small_profile, 150)
 
         raw = bytearray(b"\x02\x00")
@@ -179,9 +201,11 @@ class IppParsingTests(unittest.TestCase):
 
         self.assertEqual(meta["media-key"], small_media)
         self.assertEqual(meta["media-size-name"], small_media)
-        self.assertEqual(meta["media-x-dimension"], "13547")
-        self.assertEqual(meta["media-y-dimension"], "8128")
-        self.assertEqual((selected["width"], selected["height"]), (800, 480))
+        self.assertEqual(meta["media-x-dimension"], "8128")
+        self.assertEqual(meta["media-y-dimension"], "13547")
+        self.assertEqual((selected["width"], selected["height"]), (480, 800))
+        self.assertTrue(selected["borderless"])
+        self.assertEqual(selected["media_margin"], 0)
         self.assertEqual(document, b"%PDF-test")
 
         restored = server._stored_job_context(
@@ -190,7 +214,7 @@ class IppParsingTests(unittest.TestCase):
 
         self.assertEqual(restored["paper_id"], "paper-123")
         self.assertEqual(restored["media-size-name"], small_media)
-        self.assertEqual(restored["media-x-dimension"], "13547")
+        self.assertEqual(restored["media-x-dimension"], "8128")
 
 
 class TargetProfileTests(unittest.TestCase):

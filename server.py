@@ -30,8 +30,8 @@ _BUILT_IN_MEDIA_PROFILES = (
     {
         "media_id": "open-paper-l-13.3-inch",
         "display_name": "Open Paper L (13.3 inch)",
-        "width": 1600,
-        "height": 1200,
+        "width": 1200,
+        "height": 1600,
         "fit": "contain",
         "auto_rotate": True,
         "background": "#ffffff",
@@ -39,8 +39,8 @@ _BUILT_IN_MEDIA_PROFILES = (
     {
         "media_id": "openpaper-7-7.3-inch",
         "display_name": "OpenPaper 7 (7.3 inch)",
-        "width": 800,
-        "height": 480,
+        "width": 480,
+        "height": 800,
         "fit": "contain",
         "auto_rotate": True,
         "background": "#ffffff",
@@ -53,6 +53,7 @@ _MEDIA_JOB_FIELDS = (
     "media-x-dimension",
     "media-y-dimension",
 )
+_STANDARD_MEDIA_MARGIN = 300  # 3 mm, expressed in hundredths of a millimetre
 
 
 def _utc_timestamp_compact() -> str:
@@ -333,22 +334,38 @@ def _target_media_definition(profile: Dict[str, object], dpi: int) -> Tuple[str,
 def _selectable_target_profiles(
     default_profile: Optional[Dict[str, object]] = None,
 ) -> list[Dict[str, object]]:
-    profiles = [dict(profile) for profile in _BUILT_IN_MEDIA_PROFILES]
-    if not default_profile:
-        return profiles
+    base_profiles = [dict(profile) for profile in _BUILT_IN_MEDIA_PROFILES]
+    if default_profile:
+        default_size = (int(default_profile["width"]), int(default_profile["height"]))
+        for index, profile in enumerate(base_profiles):
+            if (int(profile["width"]), int(profile["height"])) == default_size:
+                merged = dict(profile)
+                merged.update(default_profile)
+                base_profiles[index] = merged
+                base_profiles.insert(0, base_profiles.pop(index))
+                break
+        else:
+            custom = dict(default_profile)
+            custom.setdefault("display_name", f"{default_size[0]}×{default_size[1]}")
+            base_profiles.insert(0, custom)
 
-    default_size = (int(default_profile["width"]), int(default_profile["height"]))
-    for index, profile in enumerate(profiles):
-        if (int(profile["width"]), int(profile["height"])) == default_size:
-            merged = dict(profile)
-            merged.update(default_profile)
-            profiles[index] = merged
-            profiles.insert(0, profiles.pop(index))
-            return profiles
+    profiles: list[Dict[str, object]] = []
+    for base in base_profiles:
+        base_media_id = str(base.get("media_id") or f"{base['width']}x{base['height']}")
+        base_display_name = str(
+            base.get("display_name") or f"{base['width']}×{base['height']}"
+        )
+        standard = dict(base)
+        standard["borderless"] = False
+        standard["media_margin"] = _STANDARD_MEDIA_MARGIN
+        profiles.append(standard)
 
-    custom = dict(default_profile)
-    custom.setdefault("display_name", f"{default_size[0]}×{default_size[1]}")
-    profiles.insert(0, custom)
+        borderless = dict(base)
+        borderless["borderless"] = True
+        borderless["media_margin"] = 0
+        borderless["media_id"] = f"{base_media_id}.borderless"
+        borderless["display_name"] = f"{base_display_name} – Randlos"
+        profiles.append(borderless)
     return profiles
 
 
@@ -856,12 +873,13 @@ def build_get_printer_attributes_response(
         media_name: str,
         profile: Dict[str, object],
     ) -> list[Tuple[str, int, object]]:
+        margin = int(profile.get("media_margin", 0))
         return [
             ("media-size", VT_BEGIN_COLLECTION, size),
-            ("media-bottom-margin", VT_INTEGER, 0),
-            ("media-left-margin", VT_INTEGER, 0),
-            ("media-right-margin", VT_INTEGER, 0),
-            ("media-top-margin", VT_INTEGER, 0),
+            ("media-bottom-margin", VT_INTEGER, margin),
+            ("media-left-margin", VT_INTEGER, margin),
+            ("media-right-margin", VT_INTEGER, margin),
+            ("media-top-margin", VT_INTEGER, margin),
             ("media-source", VT_KEYWORD, "auto"),
             ("media-type", VT_KEYWORD, "stationery"),
             ("media-key", VT_KEYWORD, media_name),
@@ -1020,11 +1038,22 @@ def build_get_printer_attributes_response(
     )
     add(
         "media-size-supported",
-        _ipp_collection_set("media-size-supported", [size for _, size, _ in media_definitions]),
+        _ipp_collection_set(
+            "media-size-supported",
+            [
+                size
+                for index, (_, size, _) in enumerate(media_definitions)
+                if (int(size[0][2]), int(size[1][2]))
+                not in {
+                    (int(previous[1][0][2]), int(previous[1][1][2]))
+                    for previous in media_definitions[:index]
+                }
+            ],
+        ),
     )
     for margin in ("bottom", "left", "right", "top"):
         name = f"media-{margin}-margin-supported"
-        add(name, _ipp_attr_i32(VT_INTEGER, name, 0))
+        add(name, _ipp_attr_i32_set(VT_INTEGER, name, [0, _STANDARD_MEDIA_MARGIN]))
     add("media-source-supported", _ipp_attr_str(VT_KEYWORD, "media-source-supported", "auto"))
     add("media-type-supported", _ipp_attr_str(VT_KEYWORD, "media-type-supported", "stationery"))
     add("orientation-requested-default", _ipp_attr_i32(VT_ENUM, "orientation-requested-default", 3))

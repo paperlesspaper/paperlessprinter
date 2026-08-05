@@ -184,6 +184,14 @@ class IppParsingTests(unittest.TestCase):
         self.assertEqual((selected["width"], selected["height"]), (800, 480))
         self.assertEqual(document, b"%PDF-test")
 
+        restored = server._stored_job_context(
+            {"paper_id": "paper-123", **server._media_job_context(meta)}
+        )
+
+        self.assertEqual(restored["paper_id"], "paper-123")
+        self.assertEqual(restored["media-size-name"], small_media)
+        self.assertEqual(restored["media-x-dimension"], "13547")
+
 
 class TargetProfileTests(unittest.TestCase):
     def test_profiles_are_validated_and_support_a_fallback(self):

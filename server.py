@@ -394,6 +394,15 @@ def _media_job_context(meta: Dict[str, str]) -> Dict[str, str]:
     }
 
 
+def _stored_job_context(overrides: Dict[str, str]) -> Dict[str, str]:
+    context = {
+        "paper_id": (overrides.get("paper_id") or "").strip(),
+        "auth_value": (overrides.get("auth_value") or "").strip(),
+    }
+    context.update(_media_job_context(overrides))
+    return context
+
+
 def _redacted_headers(headers) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for k, v in headers.items():
@@ -2191,7 +2200,10 @@ class IppHandler(BaseHTTPRequestHandler):
         spool_dir = Path(config["IPP_SPOOL_DIR"]).resolve() / f"{now}_{job_id}_{job_uuid}"
         spool_dir.mkdir(parents=True, exist_ok=True)
         self.server.register_job(job_id_int, spool_dir)  # type: ignore[attr-defined]
-        self.server.register_job_overrides(job_id_int, overrides)  # type: ignore[attr-defined]
+        self.server.register_job_overrides(  # type: ignore[attr-defined]
+            job_id_int,
+            {**overrides, **_media_job_context(meta)},
+        )
         self.server.set_job_state(job_id_int, 5)  # type: ignore[attr-defined]
 
         logger.info("Spooling job %s to %s", job_id, spool_dir)
@@ -2379,11 +2391,10 @@ class IppServer(ThreadingHTTPServer):
                     self._job_states[job_id] = 7
 
     def register_job_overrides(self, job_id: int, overrides: Dict[str, str]) -> None:
-        # Store only the specific override keys we care about.
-        paper_id = (overrides.get("paper_id") or "").strip()
-        auth_value = (overrides.get("auth_value") or "").strip()
+        # Keep routing and media choice across Create-Job/Send-Document.
+        context = _stored_job_context(overrides)
         with self._job_lock:
-            self._job_overrides[job_id] = {"paper_id": paper_id, "auth_value": auth_value}
+            self._job_overrides[job_id] = context
 
     def get_job_overrides(self, job_id: int) -> Dict[str, str]:
         with self._job_lock:

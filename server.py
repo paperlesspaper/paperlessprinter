@@ -33,7 +33,7 @@ _BUILT_IN_MEDIA_PROFILES = (
         "width": 1200,
         "height": 1600,
         "fit": "contain",
-        "auto_rotate": True,
+        "auto_rotate": False,
         "background": "#ffffff",
     },
     {
@@ -42,16 +42,17 @@ _BUILT_IN_MEDIA_PROFILES = (
         "width": 480,
         "height": 800,
         "fit": "contain",
-        "auto_rotate": True,
+        "auto_rotate": False,
         "background": "#ffffff",
     },
 )
-_MEDIA_JOB_FIELDS = (
+_JOB_LAYOUT_FIELDS = (
     "media",
     "media-key",
     "media-size-name",
     "media-x-dimension",
     "media-y-dimension",
+    "orientation-requested",
 )
 _STANDARD_MEDIA_MARGIN = 300  # 3 mm, expressed in hundredths of a millimetre
 
@@ -285,7 +286,7 @@ def _parse_target_profiles(raw: str) -> Dict[str, Dict[str, object]]:
         if fit not in {"contain", "cover", "stretch"}:
             raise ValueError(f"Target profile {paper_id!r} fit must be contain, cover, or stretch")
 
-        auto_rotate = raw_profile.get("auto_rotate", True)
+        auto_rotate = raw_profile.get("auto_rotate", False)
         if not isinstance(auto_rotate, bool):
             raise ValueError(f"Target profile {paper_id!r} auto_rotate must be true or false")
 
@@ -403,10 +404,10 @@ def _target_profile_for_job(
     return dict(profiles[0])
 
 
-def _media_job_context(meta: Dict[str, str]) -> Dict[str, str]:
+def _job_layout_context(meta: Dict[str, str]) -> Dict[str, str]:
     return {
         field: meta[field]
-        for field in _MEDIA_JOB_FIELDS
+        for field in _JOB_LAYOUT_FIELDS
         if (meta.get(field) or "").strip()
     }
 
@@ -416,7 +417,7 @@ def _stored_job_context(overrides: Dict[str, str]) -> Dict[str, str]:
         "paper_id": (overrides.get("paper_id") or "").strip(),
         "auth_value": (overrides.get("auth_value") or "").strip(),
     }
-    context.update(_media_job_context(overrides))
+    context.update(_job_layout_context(overrides))
     return context
 
 
@@ -1307,7 +1308,7 @@ def parse_ipp_request(raw: bytes) -> Tuple[Dict[str, str], bytes]:
             else:
                 meta[semantic_name] = decoded
 
-        if semantic_name == "job-id" and len(value) == 4:
+        if semantic_name in {"job-id", "orientation-requested"} and len(value) == 4:
             try:
                 meta[semantic_name] = str(struct.unpack(">i", value)[0])
             except Exception:
@@ -1398,7 +1399,7 @@ def fit_png_to_target(png_bytes: bytes, profile: Dict[str, object]) -> bytes:
     width = int(profile["width"])
     height = int(profile["height"])
     fit = str(profile.get("fit", "contain"))
-    auto_rotate = bool(profile.get("auto_rotate", True))
+    auto_rotate = bool(profile.get("auto_rotate", False))
     background = ImageColor.getrgb(str(profile.get("background", "#ffffff")))
 
     with Image.open(io.BytesIO(png_bytes)) as source:
@@ -1447,11 +1448,12 @@ def apply_target_profile_to_pages(
     meta["target-height"] = str(height)
     meta["target-fit"] = fit
     logger.info(
-        "Fitting rendered pages to target: size=%sx%s fit=%s auto_rotate=%s background=%s",
+        "Fitting rendered pages to target: size=%sx%s fit=%s auto_rotate=%s orientation_requested=%s background=%s",
         width,
         height,
         fit,
-        bool(profile.get("auto_rotate", True)),
+        bool(profile.get("auto_rotate", False)),
+        meta.get("orientation-requested", ""),
         profile.get("background", "#ffffff"),
     )
     return {
@@ -1990,7 +1992,7 @@ class IppHandler(BaseHTTPRequestHandler):
             try:
                 self.server.register_job_overrides(  # type: ignore[attr-defined]
                     job_id_int,
-                    {**overrides, **_media_job_context(meta)},
+                    {**overrides, **_job_layout_context(meta)},
                 )
             except Exception:
                 logger.exception("Failed to register job overrides")
@@ -2053,7 +2055,7 @@ class IppHandler(BaseHTTPRequestHandler):
                     effective_paper_id = (job_context.get("paper_id") or "").strip()
                 if not effective_auth_value:
                     effective_auth_value = (job_context.get("auth_value") or "").strip()
-                for field in _MEDIA_JOB_FIELDS:
+                for field in _JOB_LAYOUT_FIELDS:
                     if not (meta.get(field) or "").strip() and (job_context.get(field) or "").strip():
                         meta[field] = job_context[field]
 
@@ -2231,7 +2233,7 @@ class IppHandler(BaseHTTPRequestHandler):
         self.server.register_job(job_id_int, spool_dir)  # type: ignore[attr-defined]
         self.server.register_job_overrides(  # type: ignore[attr-defined]
             job_id_int,
-            {**overrides, **_media_job_context(meta)},
+            {**overrides, **_job_layout_context(meta)},
         )
         self.server.set_job_state(job_id_int, 5)  # type: ignore[attr-defined]
 

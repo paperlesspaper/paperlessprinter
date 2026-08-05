@@ -185,6 +185,11 @@ class IppParsingTests(unittest.TestCase):
             "ipps://print.example/ipp/print/paper-123/secret-token",
         )
         raw += bytes([0x02])
+        raw += server._ipp_attr_i32(
+            server.VT_ENUM,
+            "orientation-requested",
+            4,
+        )
         raw += server._ipp_collection(
             "media-col",
             [
@@ -203,18 +208,20 @@ class IppParsingTests(unittest.TestCase):
         self.assertEqual(meta["media-size-name"], small_media)
         self.assertEqual(meta["media-x-dimension"], "8128")
         self.assertEqual(meta["media-y-dimension"], "13547")
+        self.assertEqual(meta["orientation-requested"], "4")
         self.assertEqual((selected["width"], selected["height"]), (480, 800))
         self.assertTrue(selected["borderless"])
         self.assertEqual(selected["media_margin"], 0)
         self.assertEqual(document, b"%PDF-test")
 
         restored = server._stored_job_context(
-            {"paper_id": "paper-123", **server._media_job_context(meta)}
+            {"paper_id": "paper-123", **server._job_layout_context(meta)}
         )
 
         self.assertEqual(restored["paper_id"], "paper-123")
         self.assertEqual(restored["media-size-name"], small_media)
         self.assertEqual(restored["media-x-dimension"], "8128")
+        self.assertEqual(restored["orientation-requested"], "4")
 
 
 class TargetProfileTests(unittest.TestCase):
@@ -237,7 +244,7 @@ class TargetProfileTests(unittest.TestCase):
 
         self.assertEqual((large["width"], large["height"]), (1600, 1200))
         self.assertEqual(large["fit"], "contain")
-        self.assertTrue(large["auto_rotate"])
+        self.assertFalse(large["auto_rotate"])
         self.assertEqual((fallback["width"], fallback["height"]), (800, 480))
         self.assertEqual(fallback["fit"], "cover")
 
@@ -276,7 +283,7 @@ class RenderingTests(unittest.TestCase):
             self.assertEqual(image.getpixel((0, 0)), (255, 255, 255))
             self.assertEqual(image.getpixel((400, 240)), (255, 0, 0))
 
-    def test_auto_rotate_uses_the_target_orientation(self):
+    def test_auto_rotate_opt_in_uses_the_target_orientation(self):
         profile = {
             "width": 800,
             "height": 480,
@@ -291,6 +298,20 @@ class RenderingTests(unittest.TestCase):
             self.assertEqual(image.size, (800, 480))
             self.assertEqual(image.getpixel((0, 0)), (0, 255, 0))
             self.assertEqual(image.getpixel((799, 479)), (0, 255, 0))
+
+    def test_built_in_profiles_preserve_the_client_orientation(self):
+        profile = next(
+            profile
+            for profile in server._selectable_target_profiles()
+            if profile["width"] == 480 and not profile["borderless"]
+        )
+
+        result = server.fit_png_to_target(self._png(800, 480, "#00ff00"), profile)
+
+        with Image.open(io.BytesIO(result)) as image:
+            self.assertEqual(image.size, (480, 800))
+            self.assertEqual(image.getpixel((0, 0)), (255, 255, 255))
+            self.assertEqual(image.getpixel((240, 400)), (0, 255, 0))
 
     def test_cover_and_stretch_produce_both_supported_device_sizes(self):
         source = self._png(640, 480, "#0000ff")

@@ -207,7 +207,7 @@ options for a paper ID while both built-in device sizes remain selectable:
 
 ```env
 IPP_RENDER_DPI=150
-IPP_TARGET_PROFILES={"paper-id-one":{"width":1200,"height":1600,"fit":"contain"},"paper-id-two":{"width":480,"height":800,"fit":"contain","auto_rotate":true,"background":"#ffffff"}}
+IPP_TARGET_PROFILES={"paper-id-one":{"width":1200,"height":1600,"fit":"contain"},"paper-id-two":{"width":480,"height":800,"fit":"contain","auto_rotate":false,"background":"#ffffff"}}
 ```
 
 Profile options:
@@ -216,7 +216,10 @@ Profile options:
 - `fit=contain` is the default and preserves the complete page, adding the configured background where needed.
 - `fit=cover` fills the display and center-crops overflow.
 - `fit=stretch` fills the display without cropping but can distort the page.
-- `auto_rotate=true` is the default and rotates portrait/landscape content when that is a better match for the target.
+- `auto_rotate=false` is the default because macOS, Windows, and CUPS normally
+  submit data that already reflects the print-dialog orientation. Set it to
+  `true` only for unrotated source images that should be matched heuristically
+  to the target aspect ratio.
 - `background=#ffffff` is the default padding color for `contain`.
 - A profile keyed by `"*"` is used as an optional fallback when no exact paper ID matches.
 

@@ -13,13 +13,13 @@ Used in [paperlesspaper](https://paperlesspaper.de/en), the Open Source eInk pic
 ## Quick start
 
 ```bash
-cd /Users/utzel/htdocs/paperlessprinter
+cd /path/to/paperlesspaper-print
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# optional but needed for Generic IPP/PostScript printer drivers
-brew install ghostscript
+# Optional for a native install. The Docker image already includes both.
+brew install ghostscript cups-filters
 
 cp .env.example .env
 # edit .env
@@ -33,8 +33,8 @@ Server defaults to `http://0.0.0.0:8631/ipp/print`.
 
 ## Notes
 
-- This is a **minimal** IPP implementation focused on `Print-Job` payload extraction.
-- PDF jobs work out of the box. PostScript jobs from Generic IPP/PostScript drivers require Ghostscript on the server host for direct raster rendering.
+- The server advertises IPP 1.1/2.0 driverless capabilities and supports the operations used by macOS, the Microsoft IPP Class Driver, and CUPS.
+- PDF and JPEG jobs work out of the box. PWG Raster requires CUPS filters and PostScript requires Ghostscript; both are included in the Docker image.
 - For internet exposure, run behind a reverse proxy (Caddy/Nginx) for TLS.
 - If clients send `Expect: 100-continue`, keep `IPP_SEND_EXPECT_CONTINUE=false` unless you have verified your proxy path handles an origin-generated `100 Continue` correctly.
 - Set `IPP_SHARED_TOKEN` if you want a simple shared-secret header gate.
@@ -44,15 +44,67 @@ Server defaults to `http://0.0.0.0:8631/ipp/print`.
   - `AUTO_RESTART_DELAY_SECONDS=2`
   - `AUTO_RESTART_MAX=0` (0 = unlimited)
 
-## Setup (printer)
+## Printer setup
+
+Always use the complete per-printer URL when one is supplied:
+
+```text
+ipps://print.example/ipp/print/<paper-id>/<token>
+```
+
+The token is a credential. Do not paste it into public logs or screenshots. The server redacts it from new request-path log entries.
+
+### Windows 11
+
+Deploy the current Docker image first. Windows caches failed capability discovery, so remove any queue that is stuck at **Druckerdaten werden abgerufen...** before adding it again.
+
+In an elevated PowerShell window:
+
+```powershell
+Get-Printer -Name "paperlesspaper" -ErrorAction SilentlyContinue | Remove-Printer
+Add-Printer -Name "paperlesspaper" -IppURL "ipps://print.example/ipp/print/<paper-id>/<token>"
+Get-Printer -Name "paperlesspaper" | Format-List Name,DriverName,PortName,PrinterStatus
+```
+
+The driver should be **Microsoft IPP Class Driver**. You can also use **Settings → Bluetooth & devices → Printers & scanners → Add device → Add manually**, choose an IPP printer, and enter the same full IPPS URL.
+
+For Windows-side diagnostics, enable and inspect the print service event log:
+
+```powershell
+wevtutil sl Microsoft-Windows-PrintService/Operational /e:true
+Get-WinEvent -LogName Microsoft-Windows-PrintService/Operational -MaxEvents 100 |
+  Format-List TimeCreated,Id,LevelDisplayName,Message
+```
+
+### Linux (CUPS)
+
+Install CUPS client tools, then create a driverless IPP Everywhere queue:
+
+```bash
+sudo lpadmin -p paperlesspaper -E \
+  -v 'ipps://print.example/ipp/print/<paper-id>/<token>' \
+  -m everywhere
+lpstat -p paperlesspaper -l
+lp -d paperlesspaper document.pdf
+```
+
+For troubleshooting, `ipptool` can query the same endpoint directly:
+
+```bash
+ipptool -tv \
+  'ipps://print.example/ipp/print/<paper-id>/<token>' \
+  /usr/share/cups/ipptool/get-printer-attributes.test
+```
+
+### macOS
 
 You can add a printer that targets the server:
 
 - System Settings → Printers & Scanners → Add Printer…
 - Use IP address / URL:
-  - `ipp://<your-host>:8631/ipp/print`
+  - `ipps://print.example/ipp/print/<paper-id>/<token>`
 
-Driver: pick a generic PostScript/PDF-capable driver if prompted.
+Driver: prefer AirPrint or a generic IPP/PDF-capable driver if prompted.
 
 If you use a Generic PostScript / plain IPP driver on macOS, install Ghostscript on the server host so PostScript jobs can be rendered directly to PNG. AirPrint/PDF-capable queues do not need that extra dependency.
 
@@ -107,6 +159,7 @@ Full example:
 
 The server accepts optional per-request overrides for `PAPER_ID` and `POST_AUTH_VALUE` via the `/ipp/print` URL.
 This lets you configure different printers (or different printer entries) to upload to different Paper IDs or use different tokens.
+It also recovers those values from the IPP `printer-uri` attribute when a client or reverse proxy sends the HTTP request to the base `/ipp/print` path.
 
 - Path segments:
   - `ipp://<your-host>:8631/ipp/print/123` (sets `paper_id=123`)

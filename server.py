@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 
 
 logger = logging.getLogger("ipp")
+_PROCESS_STARTED_MONOTONIC = time.monotonic()
 
 
 def _utc_timestamp_compact() -> str:
@@ -99,7 +100,15 @@ def _split_ipp_path_and_overrides(raw_path: str, ipp_base_path: str) -> Tuple[Op
         if len(segs) >= 2 and "auth_value" not in overrides:
             overrides["auth_value"] = segs[1].strip()
 
-    # Redact secrets in logs (never log auth_value/token).
+    # Redact secrets in logs (never log auth_value/token). The second custom
+    # path segment carries the API credential, so it must be redacted too.
+    safe_path_only = path_only
+    if remainder and not remainder.startswith("job/"):
+        raw_segments = [segment for segment in remainder.split("/") if segment]
+        if len(raw_segments) >= 2:
+            safe_segments = [raw_segments[0], "<redacted>", *raw_segments[2:]]
+            safe_path_only = ipp_base_path.rstrip("/") + "/" + "/".join(safe_segments)
+
     safe_query_parts = []
     for k, v in qs.items():
         lk = k.lower()
@@ -108,8 +117,82 @@ def _split_ipp_path_and_overrides(raw_path: str, ipp_base_path: str) -> Tuple[Op
         else:
             safe_query_parts.append(f"{k}={v[0] if v else ''}")
     safe_query = "&".join(safe_query_parts)
-    safe_path_for_logs = path_only + (("?" + safe_query) if safe_query else "")
+    safe_path_for_logs = safe_path_only + (("?" + safe_query) if safe_query else "")
     return path_only, overrides, safe_path_for_logs
+
+
+def _ipp_uri_resource(uri: str) -> str:
+    """Return the path/query portion of an IPP URI, or an empty string."""
+    if not uri:
+        return ""
+    parts = urlsplit(uri)
+    path = parts.path or ""
+    if not path:
+        return ""
+    return path + (("?" + parts.query) if parts.query else "")
+
+
+def _overrides_from_ipp_uri(uri: str, ipp_base_path: str) -> Dict[str, str]:
+    resource = _ipp_uri_resource(uri)
+    if not resource:
+        return {}
+    _, overrides, _ = _split_ipp_path_and_overrides(resource, ipp_base_path)
+    return overrides
+
+
+def _merge_overrides(primary: Dict[str, str], fallback: Dict[str, str]) -> Dict[str, str]:
+    merged = dict(primary)
+    for key in ("paper_id", "auth_value"):
+        if not (merged.get(key) or "").strip():
+            value = (fallback.get(key) or "").strip()
+            if value:
+                merged[key] = value
+    return merged
+
+
+def _redact_http_request_line(request_line: str, ipp_base_path: str) -> str:
+    parts = request_line.split(" ", 2)
+    if len(parts) < 2:
+        return request_line
+    path_only, _, safe_path = _split_ipp_path_and_overrides(parts[1], ipp_base_path)
+    if path_only is None:
+        return request_line
+    parts[1] = safe_path
+    return " ".join(parts)
+
+
+def _external_ipp_uri(headers, request_path: str, ipp_base_path: str, ipp_printer_uri: str = "") -> str:
+    """Build the canonical externally reachable URI returned to IPP clients.
+
+    Reverse proxies terminate TLS, while the application itself sees plain HTTP.
+    Windows can also POST to the conventional base path while retaining the full
+    configured resource in the IPP printer-uri attribute, so prefer the resource
+    that contains per-printer routing information.
+    """
+    forwarded_proto = (headers.get("X-Forwarded-Proto") or "").split(",", 1)[0].strip().lower()
+    scheme = "ipps" if forwarded_proto in {"https", "ipps"} else "ipp"
+    host = (
+        (headers.get("X-Forwarded-Host") or "").split(",", 1)[0].strip()
+        or (headers.get("Host") or "").strip()
+        or "127.0.0.1"
+    )
+
+    request_resource = _ipp_uri_resource(request_path) or ipp_base_path
+    ipp_resource = _ipp_uri_resource(ipp_printer_uri)
+
+    def _valid(resource: str) -> bool:
+        path = urlsplit(resource).path or ""
+        base = ipp_base_path.rstrip("/")
+        return path == ipp_base_path or path.startswith(base + "/")
+
+    resource = request_resource if _valid(request_resource) else ipp_base_path
+    if _valid(ipp_resource):
+        _, request_overrides, _ = _split_ipp_path_and_overrides(resource, ipp_base_path)
+        _, ipp_overrides, _ = _split_ipp_path_and_overrides(ipp_resource, ipp_base_path)
+        if ipp_overrides and not request_overrides:
+            resource = ipp_resource
+
+    return f"{scheme}://{host}{resource}"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -192,8 +275,25 @@ def _ghostscript_command() -> str:
     return shutil.which("gs") or shutil.which("ghostscript") or ""
 
 
+def _pwg_raster_converter_command() -> str:
+    candidates = (
+        shutil.which("rastertopdf"),
+        "/usr/lib/cups/filter/rastertopdf",
+        "/usr/libexec/cups/filter/rastertopdf",
+        shutil.which("rastertotiff"),
+        "/usr/lib/cups/filter/rastertotiff",
+        "/usr/libexec/cups/filter/rastertotiff",
+    )
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return ""
+
+
 def _supported_document_formats() -> list[str]:
-    formats = ["application/pdf"]
+    formats = ["application/pdf", "image/jpeg"]
+    if _pwg_raster_converter_command():
+        formats.append("image/pwg-raster")
     if _ghostscript_command():
         formats.extend(["application/postscript", "application/vnd.cups-postscript"])
     return formats
@@ -204,13 +304,66 @@ def _detect_document_kind(document: bytes, meta: Dict[str, str]) -> str:
         return "pdf"
     if document.startswith(b"%!PS"):
         return "postscript"
+    if document.startswith((b"RaS2", b"RaS3", b"RaS4")):
+        return "pwg-raster"
+    if document.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if document.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
 
     declared_format = (meta.get("document-format", "") or "").strip().lower()
     if declared_format == "application/pdf":
         return "pdf"
     if declared_format in {"application/postscript", "application/vnd.cups-postscript"}:
         return "postscript"
+    if declared_format == "image/pwg-raster":
+        return "pwg-raster"
+    if declared_format in {"image/jpeg", "image/jpg"}:
+        return "jpeg"
+    if declared_format == "image/png":
+        return "png"
     return "unknown"
+
+
+def render_image_to_pngs(image_bytes: bytes, filetype: str) -> Tuple[int, Dict[int, bytes]]:
+    doc = fitz.open(stream=image_bytes, filetype=filetype)
+    try:
+        total = doc.page_count
+        if total <= 0:
+            raise ValueError(f"{filetype.upper()} payload contains zero pages")
+        pages: Dict[int, bytes] = {}
+        for index in range(total):
+            pix = doc.load_page(index).get_pixmap(alpha=False)
+            pages[index + 1] = pix.tobytes("png")
+        return total, pages
+    finally:
+        doc.close()
+
+
+def render_pwg_raster_to_pngs(raster_bytes: bytes, dpi: int, job_name: str = "") -> Tuple[int, Dict[int, bytes]]:
+    converter = _pwg_raster_converter_command()
+    if not converter:
+        raise ValueError(
+            "PWG Raster payload received but rastertopdf/rastertotiff is not installed; "
+            "install cups-filters-core-drivers"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="ipp-pwg-raster-") as temp_dir:
+        input_path = Path(temp_dir) / "input.pwg"
+        input_path.write_bytes(raster_bytes)
+        result = subprocess.run(
+            [converter, "1", "paperlesspaper", job_name or "IPP job", "1", "", str(input_path)],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0 or not result.stdout:
+            details = (result.stderr or b"PWG Raster conversion failed").decode("utf-8", errors="replace").strip()
+            raise ValueError(f"Failed to convert PWG Raster payload: {details}")
+
+        converter_name = Path(converter).name.lower()
+        if converter_name == "rastertopdf":
+            return render_pdf_to_pngs(result.stdout, dpi=dpi)
+        return render_image_to_pngs(result.stdout, "tiff")
 
 
 def render_postscript_to_pngs(document: bytes, dpi: int) -> Tuple[int, Dict[int, bytes]]:
@@ -258,9 +411,13 @@ def _op_name(operation_id: int) -> str:
         IPP_OP_VALIDATE_JOB: "Validate-Job",
         IPP_OP_CREATE_JOB: "Create-Job",
         IPP_OP_SEND_DOCUMENT: "Send-Document",
+        IPP_OP_CANCEL_JOB: "Cancel-Job",
         IPP_OP_GET_JOB_ATTRIBUTES: "Get-Job-Attributes",
         IPP_OP_GET_JOBS: "Get-Jobs",
         IPP_OP_GET_PRINTER_ATTRIBUTES: "Get-Printer-Attributes",
+        IPP_OP_CANCEL_MY_JOBS: "Cancel-My-Jobs",
+        IPP_OP_CLOSE_JOB: "Close-Job",
+        IPP_OP_IDENTIFY_PRINTER: "Identify-Printer",
     }.get(operation_id, f"op-0x{operation_id:04x}")
 
 
@@ -318,14 +475,20 @@ IPP_OP_PRINT_JOB = 0x0002
 IPP_OP_VALIDATE_JOB = 0x0004
 IPP_OP_CREATE_JOB = 0x0005
 IPP_OP_SEND_DOCUMENT = 0x0006
+IPP_OP_CANCEL_JOB = 0x0008
 IPP_OP_GET_JOB_ATTRIBUTES = 0x0009
 IPP_OP_GET_JOBS = 0x000A
 IPP_OP_GET_PRINTER_ATTRIBUTES = 0x000B
+IPP_OP_CANCEL_MY_JOBS = 0x0039
+IPP_OP_CLOSE_JOB = 0x003B
+IPP_OP_IDENTIFY_PRINTER = 0x003C
 
 
 IPP_STATUS_SUCCESSFUL_OK = 0x0000
 IPP_STATUS_CLIENT_ERROR_BAD_REQUEST = 0x0400
+IPP_STATUS_CLIENT_ERROR_NOT_POSSIBLE = 0x0404
 IPP_STATUS_SERVER_ERROR_OPERATION_NOT_SUPPORTED = 0x0501
+IPP_STATUS_SERVER_ERROR_VERSION_NOT_SUPPORTED = 0x0503
 
 
 TAG_OPERATION_ATTRIBUTES = 0x01
@@ -343,6 +506,14 @@ VT_MIME_MEDIA_TYPE = 0x49
 VT_BOOLEAN = 0x22
 VT_INTEGER = 0x21
 VT_ENUM = 0x23
+VT_OCTET_STRING = 0x30
+VT_DATETIME = 0x31
+VT_RESOLUTION = 0x32
+VT_RANGE_OF_INTEGER = 0x33
+VT_BEGIN_COLLECTION = 0x34
+VT_END_COLLECTION = 0x37
+VT_URI_SCHEME = 0x46
+VT_MEMBER_ATTR_NAME = 0x4A
 
 
 def _ipp_attr(tag: int, name: str, value: bytes) -> bytes:
@@ -374,6 +545,55 @@ def _ipp_attr_i32_set(tag: int, name: str, values: list[int]) -> bytes:
         else:
             # additional value: name-length = 0
             out += bytes([tag]) + struct.pack(">H", 0) + struct.pack(">H", 4) + struct.pack(">i", int(v))
+    return bytes(out)
+
+
+def _ipp_attr_range(name: str, lower: int, upper: int) -> bytes:
+    return _ipp_attr(VT_RANGE_OF_INTEGER, name, struct.pack(">ii", int(lower), int(upper)))
+
+
+def _ipp_attr_resolution(name: str, xdpi: int, ydpi: int, units: int = 3) -> bytes:
+    return _ipp_attr(VT_RESOLUTION, name, struct.pack(">iiB", int(xdpi), int(ydpi), int(units)))
+
+
+def _ipp_attr_datetime(name: str, value: _dt.datetime) -> bytes:
+    current = value.astimezone(_dt.UTC)
+    encoded = struct.pack(
+        ">HBBBBBBcBB",
+        current.year,
+        current.month,
+        current.day,
+        current.hour,
+        current.minute,
+        current.second,
+        0,
+        b"+",
+        0,
+        0,
+    )
+    return _ipp_attr(VT_DATETIME, name, encoded)
+
+
+def _ipp_collection(name: str, members: list[Tuple[str, int, object]]) -> bytes:
+    out = bytearray(_ipp_attr(VT_BEGIN_COLLECTION, name, b""))
+    for member_name, tag, value in members:
+        out += _ipp_attr(VT_MEMBER_ATTR_NAME, "", member_name.encode("utf-8"))
+        if tag == VT_BEGIN_COLLECTION:
+            out += _ipp_collection("", value)  # type: ignore[arg-type]
+        elif isinstance(value, int):
+            out += _ipp_attr(tag, "", struct.pack(">i", value))
+        elif isinstance(value, bytes):
+            out += _ipp_attr(tag, "", value)
+        else:
+            out += _ipp_attr(tag, "", str(value).encode("utf-8"))
+    out += _ipp_attr(VT_END_COLLECTION, "", b"")
+    return bytes(out)
+
+
+def _ipp_collection_set(name: str, collections: list[list[Tuple[str, int, object]]]) -> bytes:
+    out = bytearray()
+    for index, members in enumerate(collections):
+        out += _ipp_collection(name if index == 0 else "", members)
     return bytes(out)
 
 
@@ -413,57 +633,217 @@ def build_ipp_response_with_version(
     return bytes(response)
 
 
-def build_get_printer_attributes_response(host_header: str, ipp_path: str) -> bytes:
-    # Prefer an explicit port if provided in Host.
+def build_get_printer_attributes_response(
+    host_header: str,
+    ipp_path: str,
+    *,
+    scheme: str = "ipp",
+    printer_uri: str = "",
+    requested_attributes: Optional[list[str]] = None,
+    render_dpi: int = 150,
+) -> bytes:
     host = host_header or "127.0.0.1"
-    printer_uri = f"ipp://{host}{ipp_path}"
+    canonical_uri = printer_uri or f"{scheme}://{host}{ipp_path}"
+    security = "tls" if canonical_uri.lower().startswith("ipps://") else "none"
+    http_scheme = "https" if security == "tls" else "http"
+    info_uri = f"{http_scheme}://{host}/"
+    printer_uuid = uuid.uuid5(uuid.NAMESPACE_URL, canonical_uri)
+    up_time = max(1, int(time.monotonic() - _PROCESS_STARTED_MONOTONIC))
+    now = _dt.datetime.now(_dt.UTC)
 
-    attrs = bytearray()
-    attrs += bytes([TAG_OPERATION_ATTRIBUTES])
-    attrs += _ipp_attr_str(VT_CHARSET, "attributes-charset", "utf-8")
-    attrs += _ipp_attr_str(VT_NATURAL_LANGUAGE, "attributes-natural-language", "en")
+    formats = _supported_document_formats()
+    supports_pwg = "image/pwg-raster" in formats
+    default_format = "image/pwg-raster" if supports_pwg else "application/pdf"
 
-    attrs += bytes([TAG_PRINTER_ATTRIBUTES])
-    attrs += _ipp_attr_str(VT_URI, "printer-uri-supported", printer_uri)
-    attrs += _ipp_attr_str(VT_KEYWORD, "uri-authentication-supported", "none")
-    attrs += _ipp_attr_str(VT_KEYWORD, "uri-security-supported", "none")
-    attrs += _ipp_attr_str(VT_NAME_WITHOUT_LANGUAGE, "printer-name", "ipp-to-png")
-    attrs += _ipp_attr_str(VT_TEXT_WITHOUT_LANGUAGE, "printer-make-and-model", "ipp-to-png")
-    attrs += _ipp_attr_str(VT_KEYWORD, "ipp-versions-supported", "1.1")
-    attrs += _ipp_attr_i32_set(
-        VT_ENUM,
-        "operations-supported",
-        [
-            IPP_OP_PRINT_JOB,
-            IPP_OP_VALIDATE_JOB,
-            IPP_OP_CREATE_JOB,
-            IPP_OP_SEND_DOCUMENT,
-            IPP_OP_GET_JOB_ATTRIBUTES,
-            IPP_OP_GET_JOBS,
-            IPP_OP_GET_PRINTER_ATTRIBUTES,
-        ],
+    a4_size = [
+        ("x-dimension", VT_INTEGER, 21000),
+        ("y-dimension", VT_INTEGER, 29700),
+    ]
+    letter_size = [
+        ("x-dimension", VT_INTEGER, 21590),
+        ("y-dimension", VT_INTEGER, 27940),
+    ]
+
+    def media_col(size: list[Tuple[str, int, object]], media_name: str) -> list[Tuple[str, int, object]]:
+        return [
+            ("media-size", VT_BEGIN_COLLECTION, size),
+            ("media-bottom-margin", VT_INTEGER, 0),
+            ("media-left-margin", VT_INTEGER, 0),
+            ("media-right-margin", VT_INTEGER, 0),
+            ("media-top-margin", VT_INTEGER, 0),
+            ("media-source", VT_KEYWORD, "auto"),
+            ("media-type", VT_KEYWORD, "stationery"),
+            ("media-size-name", VT_KEYWORD, media_name),
+        ]
+
+    attributes: list[Tuple[str, bytes]] = []
+
+    def add(name: str, encoded: bytes) -> None:
+        attributes.append((name, encoded))
+
+    add("printer-uri-supported", _ipp_attr_str(VT_URI, "printer-uri-supported", canonical_uri))
+    add("uri-authentication-supported", _ipp_attr_str(VT_KEYWORD, "uri-authentication-supported", "none"))
+    add("uri-security-supported", _ipp_attr_str(VT_KEYWORD, "uri-security-supported", security))
+    add("printer-name", _ipp_attr_str(VT_NAME_WITHOUT_LANGUAGE, "printer-name", "paperlesspaper"))
+    add("printer-info", _ipp_attr_str(VT_TEXT_WITHOUT_LANGUAGE, "printer-info", "paperlesspaper virtual IPP printer"))
+    add("printer-location", _ipp_attr_str(VT_TEXT_WITHOUT_LANGUAGE, "printer-location", "Cloud"))
+    add("printer-geo-location", _ipp_attr_str(VT_URI, "printer-geo-location", "geo:0,0"))
+    add("printer-make-and-model", _ipp_attr_str(VT_TEXT_WITHOUT_LANGUAGE, "printer-make-and-model", "paperlesspaper IPP Printer"))
+    add("printer-more-info", _ipp_attr_str(VT_URI, "printer-more-info", info_uri))
+    add("printer-icons", _ipp_attr_str(VT_URI, "printer-icons", f"{info_uri.rstrip('/')}/favicon.ico"))
+    add("printer-uuid", _ipp_attr_str(VT_URI, "printer-uuid", f"urn:uuid:{printer_uuid}"))
+    add(
+        "printer-device-id",
+        _ipp_attr_str(
+            VT_TEXT_WITHOUT_LANGUAGE,
+            "printer-device-id",
+            "MFG:paperlesspaper;MDL:Virtual IPP Printer;CMD:PDF,PWG-Raster,JPEG,POSTSCRIPT;",
+        ),
     )
-    attrs += _ipp_attr_str(VT_CHARSET, "charset-configured", "utf-8")
-    attrs += _ipp_attr_str(VT_CHARSET, "charset-supported", "utf-8")
-    attrs += _ipp_attr_str(VT_NATURAL_LANGUAGE, "natural-language-configured", "en")
-    attrs += _ipp_attr_str(VT_NATURAL_LANGUAGE, "generated-natural-language-supported", "en")
-    attrs += _ipp_attr_bool("printer-is-accepting-jobs", True)
-    attrs += _ipp_attr_i32(VT_ENUM, "printer-state", 3)  # idle
-    attrs += _ipp_attr_str(VT_KEYWORD, "printer-state-reasons", "none")
-    attrs += _ipp_attr_i32(VT_INTEGER, "queued-job-count", 0)
-    attrs += _ipp_attr_str(VT_MIME_MEDIA_TYPE, "document-format-default", "application/pdf")
-    attrs += _ipp_attr_str_set(VT_MIME_MEDIA_TYPE, "document-format-supported", _supported_document_formats())
-    attrs += _ipp_attr_str(VT_KEYWORD, "compression-supported", "none")
+    add("ipp-versions-supported", _ipp_attr_str_set(VT_KEYWORD, "ipp-versions-supported", ["1.1", "2.0"]))
+    if supports_pwg:
+        add("ipp-features-supported", _ipp_attr_str(VT_KEYWORD, "ipp-features-supported", "ipp-everywhere"))
+    add(
+        "operations-supported",
+        _ipp_attr_i32_set(
+            VT_ENUM,
+            "operations-supported",
+            [
+                IPP_OP_PRINT_JOB,
+                IPP_OP_VALIDATE_JOB,
+                IPP_OP_CREATE_JOB,
+                IPP_OP_SEND_DOCUMENT,
+                IPP_OP_CANCEL_JOB,
+                IPP_OP_GET_JOB_ATTRIBUTES,
+                IPP_OP_GET_JOBS,
+                IPP_OP_GET_PRINTER_ATTRIBUTES,
+                IPP_OP_CANCEL_MY_JOBS,
+                IPP_OP_CLOSE_JOB,
+                IPP_OP_IDENTIFY_PRINTER,
+            ],
+        ),
+    )
+    add("charset-configured", _ipp_attr_str(VT_CHARSET, "charset-configured", "utf-8"))
+    add("charset-supported", _ipp_attr_str(VT_CHARSET, "charset-supported", "utf-8"))
+    add("natural-language-configured", _ipp_attr_str(VT_NATURAL_LANGUAGE, "natural-language-configured", "en"))
+    add("generated-natural-language-supported", _ipp_attr_str(VT_NATURAL_LANGUAGE, "generated-natural-language-supported", "en"))
+    add("printer-is-accepting-jobs", _ipp_attr_bool("printer-is-accepting-jobs", True))
+    add("printer-state", _ipp_attr_i32(VT_ENUM, "printer-state", 3))
+    add("printer-state-reasons", _ipp_attr_str(VT_KEYWORD, "printer-state-reasons", "none"))
+    add("queued-job-count", _ipp_attr_i32(VT_INTEGER, "queued-job-count", 0))
+    add("printer-up-time", _ipp_attr_i32(VT_INTEGER, "printer-up-time", up_time))
+    add("printer-config-change-time", _ipp_attr_i32(VT_INTEGER, "printer-config-change-time", 0))
+    add("printer-config-change-date-time", _ipp_attr_datetime("printer-config-change-date-time", now))
+    add("printer-state-change-time", _ipp_attr_i32(VT_INTEGER, "printer-state-change-time", 0))
+    add("printer-state-change-date-time", _ipp_attr_datetime("printer-state-change-date-time", now))
+    add("document-format-default", _ipp_attr_str(VT_MIME_MEDIA_TYPE, "document-format-default", default_format))
+    add("document-format-supported", _ipp_attr_str_set(VT_MIME_MEDIA_TYPE, "document-format-supported", formats))
+    add("compression-supported", _ipp_attr_str(VT_KEYWORD, "compression-supported", "none"))
+    add("pdl-override-supported", _ipp_attr_str(VT_KEYWORD, "pdl-override-supported", "attempted"))
+    add("printer-get-attributes-supported", _ipp_attr_str(VT_KEYWORD, "printer-get-attributes-supported", "document-format"))
+    add("job-ids-supported", _ipp_attr_bool("job-ids-supported", True))
+    add("multiple-document-jobs-supported", _ipp_attr_bool("multiple-document-jobs-supported", False))
+    add("multiple-operation-time-out", _ipp_attr_i32(VT_INTEGER, "multiple-operation-time-out", 30))
+    add("multiple-operation-time-out-action", _ipp_attr_str(VT_KEYWORD, "multiple-operation-time-out-action", "process-job"))
+    add("overrides-supported", _ipp_attr_str_set(VT_KEYWORD, "overrides-supported", ["document-number", "pages"]))
+    add("which-jobs-supported", _ipp_attr_str_set(VT_KEYWORD, "which-jobs-supported", ["completed", "not-completed", "all"]))
+    add("preferred-attributes-supported", _ipp_attr_bool("preferred-attributes-supported", False))
+    add(
+        "job-creation-attributes-supported",
+        _ipp_attr_str_set(
+            VT_KEYWORD,
+            "job-creation-attributes-supported",
+            [
+                "copies",
+                "finishings",
+                "ipp-attribute-fidelity",
+                "job-name",
+                "media",
+                "media-col",
+                "orientation-requested",
+                "output-bin",
+                "page-ranges",
+                "print-color-mode",
+                "print-quality",
+                "printer-resolution",
+                "requesting-user-name",
+                "sides",
+            ],
+        ),
+    )
+    add("copies-default", _ipp_attr_i32(VT_INTEGER, "copies-default", 1))
+    add("copies-supported", _ipp_attr_range("copies-supported", 1, 1))
+    add("finishings-default", _ipp_attr_i32(VT_ENUM, "finishings-default", 3))
+    add("finishings-supported", _ipp_attr_i32(VT_ENUM, "finishings-supported", 3))
+    add("media-default", _ipp_attr_str(VT_KEYWORD, "media-default", "iso_a4_210x297mm"))
+    add("media-supported", _ipp_attr_str_set(VT_KEYWORD, "media-supported", ["iso_a4_210x297mm", "na_letter_8.5x11in"]))
+    add("media-ready", _ipp_attr_str(VT_KEYWORD, "media-ready", "iso_a4_210x297mm"))
+    add("media-col-default", _ipp_collection("media-col-default", media_col(a4_size, "iso_a4_210x297mm")))
+    add("media-col-ready", _ipp_collection("media-col-ready", media_col(a4_size, "iso_a4_210x297mm")))
+    add(
+        "media-col-database",
+        _ipp_collection_set(
+            "media-col-database",
+            [media_col(a4_size, "iso_a4_210x297mm"), media_col(letter_size, "na_letter_8.5x11in")],
+        ),
+    )
+    add("media-col-supported", _ipp_attr_str_set(VT_KEYWORD, "media-col-supported", ["media-size", "media-source", "media-type", "media-bottom-margin", "media-left-margin", "media-right-margin", "media-top-margin"]))
+    add("media-size-supported", _ipp_collection_set("media-size-supported", [a4_size, letter_size]))
+    for margin in ("bottom", "left", "right", "top"):
+        name = f"media-{margin}-margin-supported"
+        add(name, _ipp_attr_i32(VT_INTEGER, name, 0))
+    add("media-source-supported", _ipp_attr_str(VT_KEYWORD, "media-source-supported", "auto"))
+    add("media-type-supported", _ipp_attr_str(VT_KEYWORD, "media-type-supported", "stationery"))
+    add("orientation-requested-default", _ipp_attr_i32(VT_ENUM, "orientation-requested-default", 3))
+    add("orientation-requested-supported", _ipp_attr_i32_set(VT_ENUM, "orientation-requested-supported", [3, 4, 5, 6]))
+    add("output-bin-default", _ipp_attr_str(VT_KEYWORD, "output-bin-default", "face-down"))
+    add("output-bin-supported", _ipp_attr_str(VT_KEYWORD, "output-bin-supported", "face-down"))
+    add("print-quality-default", _ipp_attr_i32(VT_ENUM, "print-quality-default", 4))
+    add("print-quality-supported", _ipp_attr_i32_set(VT_ENUM, "print-quality-supported", [3, 4, 5]))
+    add("printer-resolution-default", _ipp_attr_resolution("printer-resolution-default", render_dpi, render_dpi))
+    add("printer-resolution-supported", _ipp_attr_resolution("printer-resolution-supported", render_dpi, render_dpi))
+    add("sides-default", _ipp_attr_str(VT_KEYWORD, "sides-default", "one-sided"))
+    add("sides-supported", _ipp_attr_str(VT_KEYWORD, "sides-supported", "one-sided"))
+    add("page-ranges-supported", _ipp_attr_bool("page-ranges-supported", True))
+    add("color-supported", _ipp_attr_bool("color-supported", True))
+    add("print-color-mode-supported", _ipp_attr_str_set(VT_KEYWORD, "print-color-mode-supported", ["auto", "color", "monochrome"]))
+    add("print-color-mode-default", _ipp_attr_str(VT_KEYWORD, "print-color-mode-default", "auto"))
+    add("output-mode-supported", _ipp_attr_str_set(VT_KEYWORD, "output-mode-supported", ["auto", "color", "monochrome"]))
+    add("output-mode-default", _ipp_attr_str(VT_KEYWORD, "output-mode-default", "auto"))
+    add("print-content-optimize-default", _ipp_attr_str(VT_KEYWORD, "print-content-optimize-default", "auto"))
+    add("print-content-optimize-supported", _ipp_attr_str_set(VT_KEYWORD, "print-content-optimize-supported", ["auto", "graphic", "photo", "text", "text-and-graphic"]))
+    add("print-rendering-intent-default", _ipp_attr_str(VT_KEYWORD, "print-rendering-intent-default", "auto"))
+    add("print-rendering-intent-supported", _ipp_attr_str_set(VT_KEYWORD, "print-rendering-intent-supported", ["auto", "perceptual", "relative", "saturation"]))
+    add("pages-per-minute", _ipp_attr_i32(VT_INTEGER, "pages-per-minute", 1))
+    add("pages-per-minute-color", _ipp_attr_i32(VT_INTEGER, "pages-per-minute-color", 1))
+    add("identify-actions-default", _ipp_attr_str(VT_KEYWORD, "identify-actions-default", "display"))
+    add("identify-actions-supported", _ipp_attr_str(VT_KEYWORD, "identify-actions-supported", "display"))
+    add("printer-organization", _ipp_attr_str(VT_TEXT_WITHOUT_LANGUAGE, "printer-organization", "paperlesspaper"))
+    add("printer-organizational-unit", _ipp_attr_str(VT_TEXT_WITHOUT_LANGUAGE, "printer-organizational-unit", "IPP service"))
+    add(
+        "printer-supply",
+        _ipp_attr_str(
+            VT_OCTET_STRING,
+            "printer-supply",
+            "index=1;class=supplyThatIsConsumed;type=ink;unit=percent;maxcapacity=100;level=100;colorantname=none;",
+        ),
+    )
+    add("printer-supply-description", _ipp_attr_str(VT_TEXT_WITHOUT_LANGUAGE, "printer-supply-description", "Virtual supply"))
+    add("printer-supply-info-uri", _ipp_attr_str(VT_URI, "printer-supply-info-uri", info_uri))
+    if supports_pwg:
+        add("pwg-raster-document-resolution-supported", _ipp_attr_resolution("pwg-raster-document-resolution-supported", render_dpi, render_dpi))
+        add("pwg-raster-document-sheet-back", _ipp_attr_str(VT_KEYWORD, "pwg-raster-document-sheet-back", "normal"))
+        add("pwg-raster-document-type-supported", _ipp_attr_str_set(VT_KEYWORD, "pwg-raster-document-type-supported", ["sgray_8", "srgb_8"]))
 
-    # Tell clients (notably macOS/CUPS) that this printer supports color.
-    # Without these, macOS may default the print pipeline/preview to B/W.
-    attrs += _ipp_attr_bool("color-supported", True)
-    attrs += _ipp_attr_str_set(VT_KEYWORD, "print-color-mode-supported", ["auto", "color", "monochrome"])
-    attrs += _ipp_attr_str(VT_KEYWORD, "print-color-mode-default", "auto")
-    # Older/alternate attribute name still used by some clients.
-    attrs += _ipp_attr_str_set(VT_KEYWORD, "output-mode-supported", ["auto", "color", "monochrome"])
-    attrs += _ipp_attr_str(VT_KEYWORD, "output-mode-default", "auto")
+    requested = {value for value in (requested_attributes or []) if value}
+    if requested and "all" not in requested:
+        if "printer-description" not in requested and "job-template" not in requested:
+            attributes = [(name, encoded) for name, encoded in attributes if name in requested]
 
+    attrs = bytearray(build_operation_attributes())
+    attrs += bytes([TAG_PRINTER_ATTRIBUTES])
+    for _, encoded in attributes:
+        attrs += encoded
     return bytes(attrs)
 
 
@@ -475,27 +855,83 @@ def build_operation_attributes() -> bytes:
     return bytes(attrs)
 
 
-def build_get_job_attributes_response(host_header: str, ipp_path: str, job_id: int, job_state: int) -> bytes:
+def _job_attributes(
+    printer_uri: str,
+    job_id: int,
+    job_state: int,
+    job_name: str = "IPP job",
+    requested_attributes: Optional[list[str]] = None,
+    default_minimal: bool = False,
+) -> bytes:
+    attributes = [
+        ("job-id", _ipp_attr_i32(VT_INTEGER, "job-id", job_id)),
+        ("job-uri", _ipp_attr_str(VT_URI, "job-uri", f"{printer_uri.rstrip('/')}/job/{job_id}")),
+        ("job-printer-uri", _ipp_attr_str(VT_URI, "job-printer-uri", printer_uri)),
+        ("job-name", _ipp_attr_str(VT_NAME_WITHOUT_LANGUAGE, "job-name", job_name or "IPP job")),
+        (
+            "job-originating-user-name",
+            _ipp_attr_str(VT_NAME_WITHOUT_LANGUAGE, "job-originating-user-name", "anonymous"),
+        ),
+        ("job-state", _ipp_attr_i32(VT_ENUM, "job-state", job_state)),
+        ("job-state-reasons", _ipp_attr_str(VT_KEYWORD, "job-state-reasons", "none")),
+        ("time-at-creation", _ipp_attr_i32(VT_INTEGER, "time-at-creation", 0)),
+        ("time-at-processing", _ipp_attr_i32(VT_INTEGER, "time-at-processing", 0)),
+        (
+            "time-at-completed",
+            _ipp_attr_i32(VT_INTEGER, "time-at-completed", 0 if job_state != 9 else 1),
+        ),
+        (
+            "job-printer-up-time",
+            _ipp_attr_i32(
+                VT_INTEGER,
+                "job-printer-up-time",
+                max(1, int(time.monotonic() - _PROCESS_STARTED_MONOTONIC)),
+            ),
+        ),
+    ]
+    requested = {name for name in (requested_attributes or []) if name}
+    if requested and "all" not in requested:
+        attributes = [(name, value) for name, value in attributes if name in requested]
+    elif not requested and default_minimal:
+        attributes = [(name, value) for name, value in attributes if name in {"job-id", "job-uri"}]
+    return b"".join(value for _, value in attributes)
+
+
+def build_get_job_attributes_response(
+    host_header: str,
+    ipp_path: str,
+    job_id: int,
+    job_state: int,
+    printer_uri: str = "",
+) -> bytes:
     host = host_header or "127.0.0.1"
+    canonical_uri = printer_uri or f"ipp://{host}{ipp_path}"
     attrs = bytearray(build_operation_attributes())
     if job_id > 0:
         attrs += bytes([0x02])  # job-attributes-tag
-        attrs += _ipp_attr_i32(VT_INTEGER, "job-id", job_id)
-        attrs += _ipp_attr_str(VT_URI, "job-uri", f"ipp://{host}{ipp_path}/job/{job_id}")
-        attrs += _ipp_attr_i32(VT_ENUM, "job-state", job_state)
-        attrs += _ipp_attr_str(VT_KEYWORD, "job-state-reasons", "none")
+        attrs += _job_attributes(canonical_uri, job_id, job_state)
     return bytes(attrs)
 
 
-def build_get_jobs_response(host_header: str, ipp_path: str, jobs: list[Tuple[int, int]]) -> bytes:
+def build_get_jobs_response(
+    host_header: str,
+    ipp_path: str,
+    jobs: list[Tuple[int, int]],
+    printer_uri: str = "",
+    requested_attributes: Optional[list[str]] = None,
+) -> bytes:
     host = host_header or "127.0.0.1"
+    canonical_uri = printer_uri or f"ipp://{host}{ipp_path}"
     attrs = bytearray(build_operation_attributes())
     for job_id, job_state in jobs:
         attrs += bytes([0x02])  # job-attributes-tag
-        attrs += _ipp_attr_i32(VT_INTEGER, "job-id", job_id)
-        attrs += _ipp_attr_str(VT_URI, "job-uri", f"ipp://{host}{ipp_path}/job/{job_id}")
-        attrs += _ipp_attr_i32(VT_ENUM, "job-state", job_state)
-        attrs += _ipp_attr_str(VT_KEYWORD, "job-state-reasons", "none")
+        attrs += _job_attributes(
+            canonical_uri,
+            job_id,
+            job_state,
+            requested_attributes=requested_attributes,
+            default_minimal=True,
+        )
     return bytes(attrs)
 
 
@@ -523,6 +959,7 @@ def parse_ipp_request(raw: bytes) -> Tuple[Dict[str, str], bytes]:
 
     pos = 8
     current_group = None
+    operation_attribute_names: list[str] = []
 
     def _read_u16() -> int:
         nonlocal pos
@@ -570,8 +1007,24 @@ def parse_ipp_request(raw: bytes) -> Tuple[Dict[str, str], bytes]:
         # capture a few common fields if present
         # names are bytes; values may not be utf-8, so decode carefully
         name_str = name.decode("utf-8", errors="ignore")
-        if name_str in {"job-name", "document-format", "printer-uri", "requesting-user-name", "job-uri"}:
-            meta[name_str] = value.decode("utf-8", errors="ignore")
+        if current_group == 0x01 and name_len > 0:
+            operation_attribute_names.append(name_str)
+        if name_str in {
+            "compression",
+            "document-format",
+            "document-name",
+            "job-name",
+            "job-uri",
+            "printer-uri",
+            "requesting-user-name",
+            "requested-attributes",
+            "which-jobs",
+        }:
+            decoded = value.decode("utf-8", errors="ignore")
+            if name_str == "requested-attributes" and meta.get(name_str):
+                meta[name_str] += "," + decoded
+            else:
+                meta[name_str] = decoded
 
         if name_str == "job-id" and len(value) == 4:
             try:
@@ -579,6 +1032,10 @@ def parse_ipp_request(raw: bytes) -> Tuple[Dict[str, str], bytes]:
             except Exception:
                 pass
 
+        if name_str in {"last-document", "my-jobs"} and len(value) == 1:
+            meta[name_str] = "true" if value != b"\x00" else "false"
+
+    meta["_operation-attribute-names"] = ",".join(operation_attribute_names)
     document = raw[pos:]
     return meta, document
 
@@ -623,6 +1080,16 @@ def render_document_to_pngs(document: bytes, meta: Dict[str, str], dpi: int) -> 
             meta["document-format"] = "application/postscript"
         logger.info("Rendering PostScript payload to PNG via Ghostscript")
         return render_postscript_to_pngs(document, dpi=dpi)
+
+    if document_kind == "pwg-raster":
+        meta["document-format"] = "image/pwg-raster"
+        logger.info("Rendering PWG Raster payload to PNG via CUPS filters")
+        return render_pwg_raster_to_pngs(document, dpi=dpi, job_name=meta.get("job-name", ""))
+
+    if document_kind in {"jpeg", "png"}:
+        meta["document-format"] = "image/jpeg" if document_kind == "jpeg" else "image/png"
+        logger.info("Rendering %s payload to PNG via PyMuPDF", document_kind.upper())
+        return render_image_to_pngs(document, document_kind)
 
     raise ValueError(f"Unsupported document payload (first bytes={document[:12]!r})")
 
@@ -766,37 +1233,18 @@ class IppHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
-        # Cache per-client overrides when present. macOS may later omit them.
-        client_ip = (self.client_address[0] if self.client_address else "") or ""
+        # Cache per-client overrides when present. macOS and Windows may later
+        # omit them from the HTTP resource while retaining them in IPP data.
+        forwarded_for = (self.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+        client_ip = forwarded_for or (self.headers.get("X-Real-Ip") or "").strip()
+        if not client_ip:
+            client_ip = (self.client_address[0] if self.client_address else "") or ""
         user_agent = (self.headers.get("User-Agent") or "").strip()
         client_key = f"{client_ip}|{user_agent}"
         try:
             self.server.register_client_overrides(client_key, overrides)  # type: ignore[attr-defined]
         except Exception:
             logger.exception("Failed to register client overrides")
-
-        # IMPORTANT: do not fall back to .env values here.
-        # The per-request values (e.g. from a waitlist-generated printer URL) are the source of truth.
-        effective_paper_id = (overrides.get("paper_id") or "").strip()
-        effective_auth_value = (overrides.get("auth_value") or "").strip()
-
-        # If not provided on this request, reuse the last overrides seen for this client.
-        if not effective_paper_id or not effective_auth_value:
-            try:
-                cached = self.server.get_client_overrides(client_key)  # type: ignore[attr-defined]
-            except Exception:
-                cached = {}
-                logger.exception("Failed to fetch client overrides")
-            if not effective_paper_id:
-                effective_paper_id = (cached.get("paper_id") or "").strip()
-            if not effective_auth_value:
-                effective_auth_value = (cached.get("auth_value") or "").strip()
-        effective_endpoint = _resolve_endpoint_template(config.get("POST_ENDPOINT") or "", effective_paper_id)
-        post_enabled = bool(effective_endpoint)
-
-        if post_enabled and not effective_paper_id:
-            logger.warning("Upload disabled for this request: missing paper_id (path=%s)", safe_path_for_logs)
-            post_enabled = False
 
         shared = config.get("IPP_SHARED_TOKEN")
         if shared:
@@ -861,6 +1309,94 @@ class IppHandler(BaseHTTPRequestHandler):
         request_id = int(meta.get("request_id", "0") or "0")
         vmaj = int(meta.get("ipp_version_major", "1") or "1")
         vmin = int(meta.get("ipp_version_minor", "1") or "1")
+
+        def send_ipp_error(status_code: int, reason: str) -> None:
+            logger.warning("Rejecting IPP request: %s", reason)
+            response = build_ipp_response_with_version(
+                vmaj,
+                vmin,
+                status_code,
+                request_id,
+                build_operation_attributes(),
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/ipp")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            try:
+                self.wfile.write(response)
+            except ConnectionResetError:
+                logger.debug("Client reset connection while writing response")
+
+        # Validate the small set of protocol invariants discovery clients rely
+        # on. Always answer at the IPP layer so they never parse an HTML error
+        # body as a printer response.
+        if request_id == 0:
+            send_ipp_error(IPP_STATUS_CLIENT_ERROR_BAD_REQUEST, "reserved request-id 0")
+            return
+        if vmaj not in {1, 2}:
+            send_ipp_error(
+                IPP_STATUS_SERVER_ERROR_VERSION_NOT_SUPPORTED,
+                f"unsupported IPP version {vmaj}.{vmin}",
+            )
+            return
+
+        operation_attribute_names = [
+            name
+            for name in (meta.get("_operation-attribute-names", "") or "").split(",")
+            if name
+        ]
+        if operation_attribute_names[:2] != ["attributes-charset", "attributes-natural-language"]:
+            send_ipp_error(
+                IPP_STATUS_CLIENT_ERROR_BAD_REQUEST,
+                "attributes-charset and attributes-natural-language must be first",
+            )
+            return
+        printer_uri_operations = {
+            IPP_OP_PRINT_JOB,
+            IPP_OP_VALIDATE_JOB,
+            IPP_OP_CREATE_JOB,
+            IPP_OP_GET_JOBS,
+            IPP_OP_GET_PRINTER_ATTRIBUTES,
+            IPP_OP_CANCEL_MY_JOBS,
+            IPP_OP_IDENTIFY_PRINTER,
+        }
+        if operation_id in printer_uri_operations and not meta.get("printer-uri"):
+            send_ipp_error(IPP_STATUS_CLIENT_ERROR_BAD_REQUEST, "missing printer-uri operation attribute")
+            return
+
+        # Windows can use the conventional HTTP resource (/ipp/print) while
+        # carrying the full configured URI in the IPP operation attributes.
+        # Recover per-printer routing from that URI before consulting the
+        # per-client cache and optional deployment defaults.
+        overrides = _merge_overrides(
+            overrides,
+            _overrides_from_ipp_uri(meta.get("printer-uri", ""), config["IPP_PATH"]),
+        )
+        try:
+            self.server.register_client_overrides(client_key, overrides)  # type: ignore[attr-defined]
+            cached = self.server.get_client_overrides(client_key)  # type: ignore[attr-defined]
+        except Exception:
+            cached = {}
+            logger.exception("Failed to update client overrides")
+        overrides = _merge_overrides(overrides, cached)
+        overrides = _merge_overrides(
+            overrides,
+            {
+                "paper_id": config.get("PAPER_ID") or "",
+                "auth_value": config.get("POST_AUTH_VALUE") or "",
+            },
+        )
+        effective_paper_id = (overrides.get("paper_id") or "").strip()
+        effective_auth_value = (overrides.get("auth_value") or "").strip()
+        effective_endpoint = _resolve_endpoint_template(config.get("POST_ENDPOINT") or "", effective_paper_id)
+        post_enabled = bool(effective_endpoint and effective_paper_id)
+        external_printer_uri = _external_ipp_uri(
+            self.headers,
+            self.path,
+            config["IPP_PATH"],
+            meta.get("printer-uri", ""),
+        )
         logger.debug(
             "Request transport: content_length_header=%s transfer_encoding=%s raw_bytes=%d",
             length,
@@ -878,10 +1414,23 @@ class IppHandler(BaseHTTPRequestHandler):
             len(document),
         )
 
-        # macOS probes printers with Get-Printer-Attributes before it will add them.
+        # macOS, Windows, and CUPS/Linux probe capabilities before queue creation.
         if operation_id == IPP_OP_GET_PRINTER_ATTRIBUTES:
-            logger.debug("Handling Get-Printer-Attributes")
-            attr_bytes = build_get_printer_attributes_response(self.headers.get("Host", ""), config["IPP_PATH"])
+            requested_attributes = [
+                value.strip()
+                for value in (meta.get("requested-attributes", "") or "").split(",")
+                if value.strip()
+            ]
+            logger.debug("Handling Get-Printer-Attributes requested=%s", requested_attributes or "all")
+            external_parts = urlsplit(external_printer_uri)
+            attr_bytes = build_get_printer_attributes_response(
+                external_parts.netloc,
+                external_parts.path or config["IPP_PATH"],
+                scheme=external_parts.scheme or "ipp",
+                printer_uri=external_printer_uri,
+                requested_attributes=requested_attributes,
+                render_dpi=config["IPP_RENDER_DPI"],
+            )
             response = build_ipp_response_with_version(vmaj, vmin, IPP_STATUS_SUCCESSFUL_OK, request_id, attr_bytes)
             self.send_response(200)
             self.send_header("Content-Type", "application/ipp")
@@ -922,6 +1471,7 @@ class IppHandler(BaseHTTPRequestHandler):
                 config["IPP_PATH"],
                 job_id_int,
                 job_state,
+                external_printer_uri,
             )
             response = build_ipp_response_with_version(vmaj, vmin, IPP_STATUS_SUCCESSFUL_OK, request_id, attr_bytes)
             self.send_response(200)
@@ -936,12 +1486,91 @@ class IppHandler(BaseHTTPRequestHandler):
 
         if operation_id == IPP_OP_GET_JOBS:
             logger.debug("Handling Get-Jobs")
+            which_jobs = (meta.get("which-jobs") or "not-completed").strip().lower()
+            requested_attributes = [
+                value.strip()
+                for value in (meta.get("requested-attributes", "") or "").split(",")
+                if value.strip()
+            ]
+            jobs = self.server.list_jobs()  # type: ignore[attr-defined]
+            if which_jobs == "completed":
+                jobs = [(job_id, state) for job_id, state in jobs if state in {7, 8, 9}]
+            elif which_jobs != "all":
+                jobs = [(job_id, state) for job_id, state in jobs if state not in {7, 8, 9}]
             attr_bytes = build_get_jobs_response(
                 self.headers.get("Host", ""),
                 config["IPP_PATH"],
-                self.server.list_jobs(),  # type: ignore[attr-defined]
+                jobs,
+                external_printer_uri,
+                requested_attributes,
             )
             response = build_ipp_response_with_version(vmaj, vmin, IPP_STATUS_SUCCESSFUL_OK, request_id, attr_bytes)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/ipp")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            try:
+                self.wfile.write(response)
+            except ConnectionResetError:
+                logger.debug("Client reset connection while writing response")
+            return
+
+        if operation_id == IPP_OP_CANCEL_JOB:
+            job_id_str = meta.get("job-id", "")
+            job_id_int = int(job_id_str) if job_id_str.isdigit() else 0
+            logger.debug("Handling Cancel-Job job-id=%s", job_id_int or "(unknown)")
+            job_state = self.server.get_job_state(job_id_int, default=9)  # type: ignore[attr-defined]
+            if job_id_int and job_state not in {7, 8, 9}:
+                self.server.set_job_state(job_id_int, 7)  # type: ignore[attr-defined]
+                status_code = IPP_STATUS_SUCCESSFUL_OK
+            else:
+                status_code = IPP_STATUS_CLIENT_ERROR_NOT_POSSIBLE
+            response = build_ipp_response_with_version(
+                vmaj,
+                vmin,
+                status_code,
+                request_id,
+                build_operation_attributes(),
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/ipp")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            try:
+                self.wfile.write(response)
+            except ConnectionResetError:
+                logger.debug("Client reset connection while writing response")
+            return
+
+        if operation_id == IPP_OP_CANCEL_MY_JOBS:
+            logger.debug("Handling Cancel-My-Jobs")
+            self.server.cancel_active_jobs()  # type: ignore[attr-defined]
+            response = build_ipp_response_with_version(
+                vmaj,
+                vmin,
+                IPP_STATUS_SUCCESSFUL_OK,
+                request_id,
+                build_operation_attributes(),
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/ipp")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            try:
+                self.wfile.write(response)
+            except ConnectionResetError:
+                logger.debug("Client reset connection while writing response")
+            return
+
+        if operation_id in {IPP_OP_CLOSE_JOB, IPP_OP_IDENTIFY_PRINTER}:
+            logger.debug("Handling %s", _op_name(operation_id))
+            response = build_ipp_response_with_version(
+                vmaj,
+                vmin,
+                IPP_STATUS_SUCCESSFUL_OK,
+                request_id,
+                build_operation_attributes(),
+            )
             self.send_response(200)
             self.send_header("Content-Type", "application/ipp")
             self.send_header("Content-Length", str(len(response)))
@@ -973,19 +1602,14 @@ class IppHandler(BaseHTTPRequestHandler):
             except Exception:
                 logger.exception("Failed to register job overrides")
 
-            attrs = bytearray()
-            attrs += bytes([TAG_OPERATION_ATTRIBUTES])
-            attrs += _ipp_attr_str(VT_CHARSET, "attributes-charset", "utf-8")
-            attrs += _ipp_attr_str(VT_NATURAL_LANGUAGE, "attributes-natural-language", "en")
+            attrs = bytearray(build_operation_attributes())
             attrs += bytes([0x02])  # job-attributes-tag
-            attrs += _ipp_attr_i32(VT_INTEGER, "job-id", job_id_int)
-            attrs += _ipp_attr_str(
-                VT_URI,
-                "job-uri",
-                f"ipp://{self.headers.get('Host','127.0.0.1')}{config['IPP_PATH']}/job/{job_id_int}",
+            attrs += _job_attributes(
+                external_printer_uri,
+                job_id_int,
+                3,
+                meta.get("job-name", "IPP job"),
             )
-            attrs += _ipp_attr_i32(VT_ENUM, "job-state", 3)  # pending
-            attrs += _ipp_attr_str(VT_KEYWORD, "job-state-reasons", "none")
 
             response = build_ipp_response_with_version(vmaj, vmin, IPP_STATUS_SUCCESSFUL_OK, request_id, bytes(attrs))
             self.send_response(200)
@@ -1000,6 +1624,24 @@ class IppHandler(BaseHTTPRequestHandler):
 
         if operation_id == IPP_OP_SEND_DOCUMENT:
             logger.debug("Handling Send-Document")
+
+            if meta.get("last-document") != "true":
+                response = build_ipp_response_with_version(
+                    vmaj,
+                    vmin,
+                    IPP_STATUS_CLIENT_ERROR_BAD_REQUEST,
+                    request_id,
+                    build_operation_attributes(),
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "application/ipp")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                try:
+                    self.wfile.write(response)
+                except ConnectionResetError:
+                    logger.debug("Client reset connection while writing response")
+                return
 
             job_id_str = meta.get("job-id", "")
             job_id_int = int(job_id_str) if job_id_str.isdigit() else 0
@@ -1166,10 +1808,15 @@ class IppHandler(BaseHTTPRequestHandler):
             return
 
         # Everything below is for Print-Job.
-        job_id = uuid.uuid4().hex
+        job_id_int = self.server.allocate_job_id()  # type: ignore[attr-defined]
+        job_id = str(job_id_int)
+        job_uuid = uuid.uuid4().hex
         now = _utc_timestamp_compact()
-        spool_dir = Path(config["IPP_SPOOL_DIR"]).resolve() / f"{now}_{job_id}"
+        spool_dir = Path(config["IPP_SPOOL_DIR"]).resolve() / f"{now}_{job_id}_{job_uuid}"
         spool_dir.mkdir(parents=True, exist_ok=True)
+        self.server.register_job(job_id_int, spool_dir)  # type: ignore[attr-defined]
+        self.server.register_job_overrides(job_id_int, overrides)  # type: ignore[attr-defined]
+        self.server.set_job_state(job_id_int, 5)  # type: ignore[attr-defined]
 
         logger.info("Spooling job %s to %s", job_id, spool_dir)
 
@@ -1247,20 +1894,39 @@ class IppHandler(BaseHTTPRequestHandler):
                 )
                 thread.start()
             else:
-                logger.info("Upload disabled (POST_ENDPOINT empty); skipping POST")
+                if config.get("POST_ENDPOINT") and not effective_paper_id:
+                    logger.warning("Upload disabled for this job: missing paper_id (path=%s)", safe_path_for_logs)
+                else:
+                    logger.info("Upload disabled (POST_ENDPOINT empty); skipping POST")
+
+            self.server.set_job_state(job_id_int, 9)  # type: ignore[attr-defined]
 
         except ValueError as e:
+            self.server.set_job_state(job_id_int, 8)  # type: ignore[attr-defined]
             logger.warning("%s", e)
             self.send_error(415, str(e))
             return
         except Exception as e:
+            self.server.set_job_state(job_id_int, 8)  # type: ignore[attr-defined]
             logger.exception("Render/POST failed")
             self.send_error(500, f"Render/POST failed: {e}")
             return
 
-        # Minimal IPP success response
-        # version 1.1, status successful-ok (0x0000), same request-id
-        response = build_ipp_response_with_version(vmaj, vmin, IPP_STATUS_SUCCESSFUL_OK, request_id, b"")
+        response_attrs = bytearray(build_operation_attributes())
+        response_attrs += bytes([0x02])
+        response_attrs += _job_attributes(
+            external_printer_uri,
+            job_id_int,
+            9,
+            meta.get("job-name", "IPP job"),
+        )
+        response = build_ipp_response_with_version(
+            vmaj,
+            vmin,
+            IPP_STATUS_SUCCESSFUL_OK,
+            request_id,
+            bytes(response_attrs),
+        )
 
         self.send_response(200)
         self.send_header("Content-Type", "application/ipp")
@@ -1273,8 +1939,15 @@ class IppHandler(BaseHTTPRequestHandler):
         logger.debug("IPP response sent: status=successful-ok request_id=%s", request_id)
 
     def log_message(self, format: str, *args) -> None:
-        # keep default logging (stderr), but include client ip
-        super().log_message(format, *args)
+        # BaseHTTPRequestHandler logs the raw HTTP request line separately from
+        # our structured request log. Redact the credential-bearing URL there
+        # as well so access logs cannot leak per-printer tokens.
+        ipp_base_path = getattr(self.server, "config", {}).get("IPP_PATH", "/ipp/print")
+        safe_args = tuple(
+            _redact_http_request_line(value, ipp_base_path) if isinstance(value, str) else value
+            for value in args
+        )
+        super().log_message(format, *safe_args)
 
 
 class IppServer(ThreadingHTTPServer):
@@ -1313,6 +1986,12 @@ class IppServer(ThreadingHTTPServer):
     def list_jobs(self) -> list[Tuple[int, int]]:
         with self._job_lock:
             return [(job_id, int(self._job_states.get(job_id, 9))) for job_id in sorted(self._jobs)]
+
+    def cancel_active_jobs(self) -> None:
+        with self._job_lock:
+            for job_id, state in list(self._job_states.items()):
+                if state not in {7, 8, 9}:
+                    self._job_states[job_id] = 7
 
     def register_job_overrides(self, job_id: int, overrides: Dict[str, str]) -> None:
         # Store only the specific override keys we care about.

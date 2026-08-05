@@ -110,9 +110,9 @@ class IppParsingTests(unittest.TestCase):
         self.assertIn(b"ipp-versions-supported", response)
         self.assertIn(b"media-col-database", response)
 
-    def test_target_profile_advertises_only_its_exact_custom_media(self):
+    def test_advertises_both_named_open_paper_media_sizes(self):
         profile = server._parse_target_profiles(
-            '{"paper-123":{"width":1600,"height":1200}}'
+            '{"paper-123":{"width":800,"height":480}}'
         )["paper-123"]
 
         response = server.build_get_printer_attributes_response(
@@ -123,10 +123,66 @@ class IppParsingTests(unittest.TestCase):
             render_dpi=150,
         )
 
-        self.assertIn(b"custom_1600x1200_270.93x203.20mm", response)
+        self.assertIn(b"custom_open-paper-l-13.3-inch_270.93x203.20mm", response)
+        self.assertIn(b"custom_openpaper-7-7.3-inch_135.47x81.28mm", response)
+        self.assertIn(b"Open Paper L (13.3 inch)", response)
+        self.assertIn(b"OpenPaper 7 (7.3 inch)", response)
         self.assertIn(struct.pack(">i", 27093), response)
         self.assertIn(struct.pack(">i", 20320), response)
+        self.assertIn(struct.pack(">i", 13547), response)
+        self.assertIn(struct.pack(">i", 8128), response)
         self.assertNotIn(b"iso_a4_210x297mm", response)
+
+        small_media, _ = server._target_media_definition(
+            server._selectable_target_profiles(profile)[0],
+            150,
+        )
+        self.assertIn(
+            server._ipp_attr_str(server.VT_KEYWORD, "media-default", small_media),
+            response,
+        )
+
+    def test_media_col_selection_drives_exact_target_profile(self):
+        profiles = server._selectable_target_profiles()
+        small_profile = next(profile for profile in profiles if profile["width"] == 800)
+        small_media, small_size = server._target_media_definition(small_profile, 150)
+
+        raw = bytearray(b"\x02\x00")
+        raw += struct.pack(">H", server.IPP_OP_PRINT_JOB)
+        raw += struct.pack(">I", 4321)
+        raw += bytes([server.TAG_OPERATION_ATTRIBUTES])
+        raw += server._ipp_attr_str(server.VT_CHARSET, "attributes-charset", "utf-8")
+        raw += server._ipp_attr_str(
+            server.VT_NATURAL_LANGUAGE,
+            "attributes-natural-language",
+            "en",
+        )
+        raw += server._ipp_attr_str(
+            server.VT_URI,
+            "printer-uri",
+            "ipps://print.example/ipp/print/paper-123/secret-token",
+        )
+        raw += bytes([0x02])
+        raw += server._ipp_collection(
+            "media-col",
+            [
+                ("media-size", server.VT_BEGIN_COLLECTION, small_size),
+                ("media-key", server.VT_KEYWORD, small_media),
+                ("media-size-name", server.VT_KEYWORD, small_media),
+            ],
+        )
+        raw += bytes([server.TAG_END_OF_ATTRIBUTES])
+        raw += b"%PDF-test"
+
+        meta, document = server.parse_ipp_request(bytes(raw))
+        selected = server._target_profile_for_job(meta, 150)
+
+        self.assertEqual(meta["media-key"], small_media)
+        self.assertEqual(meta["media-size-name"], small_media)
+        self.assertEqual(meta["media-x-dimension"], "13547")
+        self.assertEqual(meta["media-y-dimension"], "8128")
+        self.assertEqual((selected["width"], selected["height"]), (800, 480))
+        self.assertEqual(document, b"%PDF-test")
 
 
 class TargetProfileTests(unittest.TestCase):

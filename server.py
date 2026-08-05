@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -25,6 +26,33 @@ from PIL import Image, ImageColor, ImageOps
 logger = logging.getLogger("ipp")
 _PROCESS_STARTED_MONOTONIC = time.monotonic()
 _MAX_TARGET_PIXELS = 100_000_000
+_BUILT_IN_MEDIA_PROFILES = (
+    {
+        "media_id": "open-paper-l-13.3-inch",
+        "display_name": "Open Paper L (13.3 inch)",
+        "width": 1600,
+        "height": 1200,
+        "fit": "contain",
+        "auto_rotate": True,
+        "background": "#ffffff",
+    },
+    {
+        "media_id": "openpaper-7-7.3-inch",
+        "display_name": "OpenPaper 7 (7.3 inch)",
+        "width": 800,
+        "height": 480,
+        "fit": "contain",
+        "auto_rotate": True,
+        "background": "#ffffff",
+    },
+)
+_MEDIA_JOB_FIELDS = (
+    "media",
+    "media-key",
+    "media-size-name",
+    "media-x-dimension",
+    "media-y-dimension",
+)
 
 
 def _utc_timestamp_compact() -> str:
@@ -293,11 +321,77 @@ def _target_media_definition(profile: Dict[str, object], dpi: int) -> Tuple[str,
     height_hundredths_mm = max(1, round(height * 2540 / effective_dpi))
     width_mm = width_hundredths_mm / 100
     height_mm = height_hundredths_mm / 100
-    media_name = f"custom_{width}x{height}_{width_mm:.2f}x{height_mm:.2f}mm"
+    raw_media_id = str(profile.get("media_id") or f"{width}x{height}").strip().lower()
+    media_id = re.sub(r"[^a-z0-9.-]+", "-", raw_media_id).strip("-") or f"{width}x{height}"
+    media_name = f"custom_{media_id}_{width_mm:.2f}x{height_mm:.2f}mm"
     return media_name, [
         ("x-dimension", VT_INTEGER, width_hundredths_mm),
         ("y-dimension", VT_INTEGER, height_hundredths_mm),
     ]
+
+
+def _selectable_target_profiles(
+    default_profile: Optional[Dict[str, object]] = None,
+) -> list[Dict[str, object]]:
+    profiles = [dict(profile) for profile in _BUILT_IN_MEDIA_PROFILES]
+    if not default_profile:
+        return profiles
+
+    default_size = (int(default_profile["width"]), int(default_profile["height"]))
+    for index, profile in enumerate(profiles):
+        if (int(profile["width"]), int(profile["height"])) == default_size:
+            merged = dict(profile)
+            merged.update(default_profile)
+            profiles[index] = merged
+            profiles.insert(0, profiles.pop(index))
+            return profiles
+
+    custom = dict(default_profile)
+    custom.setdefault("display_name", f"{default_size[0]}×{default_size[1]}")
+    profiles.insert(0, custom)
+    return profiles
+
+
+def _target_profile_for_job(
+    meta: Dict[str, str],
+    dpi: int,
+    default_profile: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    profiles = _selectable_target_profiles(default_profile)
+    selected_names = {
+        (meta.get(field) or "").strip().lower()
+        for field in ("media", "media-key", "media-size-name")
+        if (meta.get(field) or "").strip()
+    }
+    if selected_names:
+        for profile in profiles:
+            media_name, _ = _target_media_definition(profile, dpi)
+            if media_name.lower() in selected_names:
+                return dict(profile)
+
+    try:
+        selected_size = (
+            int(meta.get("media-x-dimension") or "0"),
+            int(meta.get("media-y-dimension") or "0"),
+        )
+    except ValueError:
+        selected_size = (0, 0)
+    if selected_size != (0, 0):
+        for profile in profiles:
+            _, size = _target_media_definition(profile, dpi)
+            profile_size = (int(size[0][2]), int(size[1][2]))
+            if profile_size == selected_size:
+                return dict(profile)
+
+    return dict(profiles[0])
+
+
+def _media_job_context(meta: Dict[str, str]) -> Dict[str, str]:
+    return {
+        field: meta[field]
+        for field in _MEDIA_JOB_FIELDS
+        if (meta.get(field) or "").strip()
+    }
 
 
 def _redacted_headers(headers) -> Dict[str, str]:
@@ -740,30 +834,19 @@ def build_get_printer_attributes_response(
     supports_pwg = "image/pwg-raster" in formats
     default_format = "image/pwg-raster" if supports_pwg else "application/pdf"
 
-    a4_size = [
-        ("x-dimension", VT_INTEGER, 21000),
-        ("y-dimension", VT_INTEGER, 29700),
+    selectable_profiles = _selectable_target_profiles(target_profile)
+    media_definitions = [
+        (*_target_media_definition(profile, render_dpi), profile)
+        for profile in selectable_profiles
     ]
-    letter_size = [
-        ("x-dimension", VT_INTEGER, 21590),
-        ("y-dimension", VT_INTEGER, 27940),
-    ]
-    if target_profile:
-        target_media_name, target_size = _target_media_definition(target_profile, render_dpi)
-        media_definitions = [(target_media_name, target_size)]
-        printer_info = (
-            f"paperlesspaper {int(target_profile['width'])}x{int(target_profile['height'])} "
-            "virtual IPP printer"
-        )
-    else:
-        media_definitions = [
-            ("iso_a4_210x297mm", a4_size),
-            ("na_letter_8.5x11in", letter_size),
-        ]
-        printer_info = "paperlesspaper virtual IPP printer"
-    default_media_name, default_media_size = media_definitions[0]
+    default_media_name, default_media_size, _ = media_definitions[0]
+    printer_info = "paperlesspaper virtual IPP printer for Open Paper displays"
 
-    def media_col(size: list[Tuple[str, int, object]], media_name: str) -> list[Tuple[str, int, object]]:
+    def media_col(
+        size: list[Tuple[str, int, object]],
+        media_name: str,
+        profile: Dict[str, object],
+    ) -> list[Tuple[str, int, object]]:
         return [
             ("media-size", VT_BEGIN_COLLECTION, size),
             ("media-bottom-margin", VT_INTEGER, 0),
@@ -772,6 +855,12 @@ def build_get_printer_attributes_response(
             ("media-top-margin", VT_INTEGER, 0),
             ("media-source", VT_KEYWORD, "auto"),
             ("media-type", VT_KEYWORD, "stationery"),
+            ("media-key", VT_KEYWORD, media_name),
+            (
+                "media-info",
+                VT_TEXT_WITHOUT_LANGUAGE,
+                str(profile.get("display_name") or f"{profile['width']}×{profile['height']}"),
+            ),
             ("media-size-name", VT_KEYWORD, media_name),
         ]
 
@@ -877,28 +966,52 @@ def build_get_printer_attributes_response(
     add("media-default", _ipp_attr_str(VT_KEYWORD, "media-default", default_media_name))
     add(
         "media-supported",
-        _ipp_attr_str_set(VT_KEYWORD, "media-supported", [name for name, _ in media_definitions]),
+        _ipp_attr_str_set(VT_KEYWORD, "media-supported", [name for name, _, _ in media_definitions]),
     )
     add("media-ready", _ipp_attr_str(VT_KEYWORD, "media-ready", default_media_name))
     add(
         "media-col-default",
-        _ipp_collection("media-col-default", media_col(default_media_size, default_media_name)),
+        _ipp_collection(
+            "media-col-default",
+            media_col(default_media_size, default_media_name, media_definitions[0][2]),
+        ),
     )
     add(
         "media-col-ready",
-        _ipp_collection("media-col-ready", media_col(default_media_size, default_media_name)),
+        _ipp_collection(
+            "media-col-ready",
+            media_col(default_media_size, default_media_name, media_definitions[0][2]),
+        ),
     )
     add(
         "media-col-database",
         _ipp_collection_set(
             "media-col-database",
-            [media_col(size, name) for name, size in media_definitions],
+            [media_col(size, name, profile) for name, size, profile in media_definitions],
         ),
     )
-    add("media-col-supported", _ipp_attr_str_set(VT_KEYWORD, "media-col-supported", ["media-size", "media-source", "media-type", "media-bottom-margin", "media-left-margin", "media-right-margin", "media-top-margin"]))
+    add(
+        "media-col-supported",
+        _ipp_attr_str_set(
+            VT_KEYWORD,
+            "media-col-supported",
+            [
+                "media-size",
+                "media-source",
+                "media-type",
+                "media-key",
+                "media-info",
+                "media-size-name",
+                "media-bottom-margin",
+                "media-left-margin",
+                "media-right-margin",
+                "media-top-margin",
+            ],
+        ),
+    )
     add(
         "media-size-supported",
-        _ipp_collection_set("media-size-supported", [size for _, size in media_definitions]),
+        _ipp_collection_set("media-size-supported", [size for _, size, _ in media_definitions]),
     )
     for margin in ("bottom", "left", "right", "top"):
         name = f"media-{margin}-margin-supported"
@@ -1071,6 +1184,8 @@ def parse_ipp_request(raw: bytes) -> Tuple[Dict[str, str], bytes]:
     pos = 8
     current_group = None
     operation_attribute_names: list[str] = []
+    collection_depth = 0
+    current_member_name = ""
 
     def _read_u16() -> int:
         nonlocal pos
@@ -1115,12 +1230,26 @@ def parse_ipp_request(raw: bytes) -> Tuple[Dict[str, str], bytes]:
         value_len = _read_u16()
         value = _read_bytes(value_len)
 
-        # capture a few common fields if present
-        # names are bytes; values may not be utf-8, so decode carefully
+        # Collection members use memberAttrName followed by an unnamed value.
+        # Preserve the semantic member name so media-col selections from
+        # Windows/macOS/CUPS can drive exact output sizing.
         name_str = name.decode("utf-8", errors="ignore")
+        semantic_name = name_str
+        if tag == VT_MEMBER_ATTR_NAME:
+            current_member_name = value.decode("utf-8", errors="ignore")
+            continue
+        if collection_depth and name_len == 0 and current_member_name:
+            semantic_name = current_member_name
+            current_member_name = ""
+
+        if tag == VT_BEGIN_COLLECTION:
+            collection_depth += 1
+        elif tag == VT_END_COLLECTION:
+            collection_depth = max(0, collection_depth - 1)
+
         if current_group == 0x01 and name_len > 0:
             operation_attribute_names.append(name_str)
-        if name_str in {
+        if semantic_name in {
             "compression",
             "document-format",
             "document-name",
@@ -1130,21 +1259,30 @@ def parse_ipp_request(raw: bytes) -> Tuple[Dict[str, str], bytes]:
             "requesting-user-name",
             "requested-attributes",
             "which-jobs",
+            "media",
+            "media-key",
+            "media-size-name",
         }:
             decoded = value.decode("utf-8", errors="ignore")
-            if name_str == "requested-attributes" and meta.get(name_str):
-                meta[name_str] += "," + decoded
+            if semantic_name == "requested-attributes" and meta.get(semantic_name):
+                meta[semantic_name] += "," + decoded
             else:
-                meta[name_str] = decoded
+                meta[semantic_name] = decoded
 
-        if name_str == "job-id" and len(value) == 4:
+        if semantic_name == "job-id" and len(value) == 4:
             try:
-                meta[name_str] = str(struct.unpack(">i", value)[0])
+                meta[semantic_name] = str(struct.unpack(">i", value)[0])
             except Exception:
                 pass
 
-        if name_str in {"last-document", "my-jobs"} and len(value) == 1:
-            meta[name_str] = "true" if value != b"\x00" else "false"
+        if semantic_name in {"x-dimension", "y-dimension"} and len(value) == 4:
+            try:
+                meta[f"media-{semantic_name}"] = str(struct.unpack(">i", value)[0])
+            except Exception:
+                pass
+
+        if semantic_name in {"last-document", "my-jobs"} and len(value) == 1:
+            meta[semantic_name] = "true" if value != b"\x00" else "false"
 
     meta["_operation-attribute-names"] = ",".join(operation_attribute_names)
     document = raw[pos:]
@@ -1593,9 +1731,14 @@ class IppHandler(BaseHTTPRequestHandler):
         )
         effective_paper_id = (overrides.get("paper_id") or "").strip()
         effective_auth_value = (overrides.get("auth_value") or "").strip()
-        target_profile = _target_profile_for_paper_id(
+        paper_default_profile = _target_profile_for_paper_id(
             config.get("IPP_TARGET_PROFILES") or {},
             effective_paper_id,
+        )
+        target_profile = _target_profile_for_job(
+            meta,
+            config["IPP_RENDER_DPI"],
+            paper_default_profile,
         )
         effective_endpoint = _resolve_endpoint_template(config.get("POST_ENDPOINT") or "", effective_paper_id)
         post_enabled = bool(effective_endpoint and effective_paper_id)
@@ -1807,7 +1950,10 @@ class IppHandler(BaseHTTPRequestHandler):
             # Persist any per-request overrides so Send-Document can reuse them.
             # macOS may not preserve query params/path segments on the follow-up request.
             try:
-                self.server.register_job_overrides(job_id_int, overrides)  # type: ignore[attr-defined]
+                self.server.register_job_overrides(  # type: ignore[attr-defined]
+                    job_id_int,
+                    {**overrides, **_media_job_context(meta)},
+                )
             except Exception:
                 logger.exception("Failed to register job overrides")
 
@@ -1859,21 +2005,29 @@ class IppHandler(BaseHTTPRequestHandler):
 
             # Resolve overrides for this job.
             # If the HTTP path doesn't carry query params anymore (common on macOS), reuse Create-Job overrides.
-            if job_id_int and (not effective_paper_id or not effective_auth_value):
+            job_context: Dict[str, str] = {}
+            if job_id_int:
                 try:
-                    job_overrides = self.server.get_job_overrides(job_id_int)  # type: ignore[attr-defined]
+                    job_context = self.server.get_job_overrides(job_id_int)  # type: ignore[attr-defined]
                 except Exception:
-                    job_overrides = {}
                     logger.exception("Failed to fetch job overrides")
                 if not effective_paper_id:
-                    effective_paper_id = (job_overrides.get("paper_id") or "").strip()
+                    effective_paper_id = (job_context.get("paper_id") or "").strip()
                 if not effective_auth_value:
-                    effective_auth_value = (job_overrides.get("auth_value") or "").strip()
+                    effective_auth_value = (job_context.get("auth_value") or "").strip()
+                for field in _MEDIA_JOB_FIELDS:
+                    if not (meta.get(field) or "").strip() and (job_context.get(field) or "").strip():
+                        meta[field] = job_context[field]
 
             # Recompute endpoint/post_enabled now that we may have effective_paper_id.
-            target_profile = _target_profile_for_paper_id(
+            paper_default_profile = _target_profile_for_paper_id(
                 config.get("IPP_TARGET_PROFILES") or {},
                 effective_paper_id,
+            )
+            target_profile = _target_profile_for_job(
+                meta,
+                config["IPP_RENDER_DPI"],
+                paper_default_profile,
             )
             effective_endpoint = _resolve_endpoint_template(config.get("POST_ENDPOINT") or "", effective_paper_id)
             post_enabled = bool(effective_endpoint)

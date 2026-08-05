@@ -186,7 +186,18 @@ It also recovers those values from the IPP `printer-uri` attribute when a client
 
 #### Exact output sizes per device
 
-Use `IPP_TARGET_PROFILES` to assign an exact pixel canvas to each paper ID. The server advertises a matching custom media size during IPP discovery and normalizes every uploaded PNG to the configured dimensions.
+The server always advertises these two selectable device sizes during IPP
+discovery:
+
+- **Open Paper L (13.3 inch)** — 1600×1200 pixels
+- **OpenPaper 7 (7.3 inch)** — 800×480 pixels
+
+When a client submits `media` or `media-col`, the selected entry controls the
+exact output canvas. The server also preserves the selection across the
+Create-Job/Send-Document workflow used by macOS and some Windows clients.
+
+`IPP_TARGET_PROFILES` is optional. It can set the default size and fitting
+options for a paper ID while both built-in device sizes remain selectable:
 
 ```env
 IPP_RENDER_DPI=150
@@ -203,7 +214,10 @@ Profile options:
 - `background=#ffffff` is the default padding color for `contain`.
 - A profile keyed by `"*"` is used as an optional fallback when no exact paper ID matches.
 
-At 150 dpi, a 1600×1200 profile is advertised as approximately 270.93×203.20 mm and an 800×480 profile as approximately 135.47×81.28 mm. This makes a driverless client generate the intended raster dimensions; the final server-side normalization still guarantees the exact configured pixel size.
+At 150 dpi, Open Paper L is advertised as approximately 270.93×203.20 mm and
+OpenPaper 7 as approximately 135.47×81.28 mm. This makes a driverless client
+generate the intended raster dimensions; final server-side normalization still
+guarantees the exact selected pixel size.
 
 Windows, macOS, and CUPS cache printer capabilities. Remove and re-add an existing printer after changing its profile so the print dialog receives the new custom media size.
 
